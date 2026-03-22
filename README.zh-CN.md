@@ -37,6 +37,17 @@ OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
 
+## CI 镜像构建
+
+现在仓库已经带了自动构建 runner 镜像的 GitHub Actions：
+
+- Workflow：`.github/workflows/build-runner-image.yml`
+- 镜像仓库：`ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- 默认标签：`latest`、分支名、Git Tag、`sha-*`
+
+部署时如果希望直接使用 CI 构建产物，可以把 `OPENCLAW_RUNNER_IMAGE`
+改成对应的 GHCR 镜像地址。
+
 说明：
 
 - `ADMIN_EMAIL` / `ADMIN_NAME` / `ADMIN_PASSWORD`

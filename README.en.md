@@ -37,6 +37,17 @@ OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
 
+## CI Image Build
+
+The repository now includes a GitHub Actions workflow that automatically builds the runner image:
+
+- Workflow: `.github/workflows/build-runner-image.yml`
+- Registry: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- Tags: `latest`, branch name, Git tag, and `sha-*`
+
+If you want deployments to consume the CI artifact directly, set
+`OPENCLAW_RUNNER_IMAGE` to the published GHCR image reference.
+
 Notes:
 
 - `ADMIN_EMAIL` / `ADMIN_NAME` / `ADMIN_PASSWORD`

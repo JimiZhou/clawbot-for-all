@@ -42,3 +42,11 @@ ADMIN_PASSWORD=ChangeMe123!
 OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
+
+## CI Image
+
+GitHub Actions now builds the runner image automatically:
+
+- Workflow: `.github/workflows/build-runner-image.yml`
+- Registry: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- Tags: `latest`, branch name, git tag, and `sha-*`
