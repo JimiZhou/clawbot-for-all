@@ -1,0 +1,15 @@
+{
+  "name": "clawbot-for-all",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-tenant OpenClaw launcher with a custom web control panel.",
+  "scripts": {
+    "dev": "node --watch src/server.mjs",
+    "start": "node src/server.mjs",
+    "check": "node --check src/server.mjs"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
