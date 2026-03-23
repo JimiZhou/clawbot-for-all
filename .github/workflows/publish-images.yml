@@ -1,0 +1,111 @@
+name: Publish Images
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-images:
+    name: Build ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: app image
+            image_name: clawbot-for-all
+            dockerfile: Dockerfile
+          - label: runner image
+            image_name: clawbot-openclaw-runner
+            dockerfile: containers/openclaw-runner/Dockerfile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare image name
+        id: prep
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/${{ matrix.image_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prep.outputs.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and optionally push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-images
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare release notes
+        id: notes
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          tag="${GITHUB_REF_NAME}"
+          cat > release-notes.md <<EOF
+          ## Container Images
+
+          - App image: \`ghcr.io/${owner}/clawbot-for-all:${tag}\`
+          - Runner image: \`ghcr.io/${owner}/clawbot-openclaw-runner:${tag}\`
+
+          ## Pull Commands
+
+          \`\`\`bash
+          docker pull ghcr.io/${owner}/clawbot-for-all:${tag}
+          docker pull ghcr.io/${owner}/clawbot-openclaw-runner:${tag}
+          \`\`\`
+
+          ## Latest Aliases
+
+          - \`ghcr.io/${owner}/clawbot-for-all:latest\`
+          - \`ghcr.io/${owner}/clawbot-openclaw-runner:latest\`
+          EOF
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          tag_name: ${{ github.ref_name }}

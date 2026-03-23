@@ -33,20 +33,9 @@ PUBLIC_ORIGIN=http://127.0.0.1:4300
 ADMIN_EMAIL=admin@example.com
 ADMIN_NAME=平台管理员
 ADMIN_PASSWORD=ChangeMe123!
-OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
+OPENCLAW_RUNNER_IMAGE=ghcr.io/jimizhou/clawbot-openclaw-runner:latest
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
-
-## CI 镜像构建
-
-现在仓库已经带了自动构建 runner 镜像的 GitHub Actions：
-
-- Workflow：`.github/workflows/build-runner-image.yml`
-- 镜像仓库：`ghcr.io/<github-owner>/clawbot-openclaw-runner`
-- 默认标签：`latest`、分支名、Git Tag、`sha-*`
-
-部署时如果希望直接使用 CI 构建产物，可以把 `OPENCLAW_RUNNER_IMAGE`
-改成对应的 GHCR 镜像地址。
 
 说明：
 
@@ -55,6 +44,16 @@ OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 - 若该邮箱已存在，系统会确保其角色为 `admin`
 - 新建管理员会自动带 `mustChangePassword=true`
 - `PUBLIC_ORIGIN` 用于生成邀请码注册链接
+
+## 镜像发布
+
+仓库内置了自动发布镜像和写入 Release 镜像地址的 GitHub Actions：
+
+- Workflow：`.github/workflows/publish-images.yml`
+- 应用镜像：`ghcr.io/<github-owner>/clawbot-for-all`
+- Runner 镜像：`ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- 默认标签：`latest`、分支名、Git Tag、`sha-*`
+- 当推送 `v*` 标签时，会自动把对应镜像地址写入 GitHub Release
 
 ## 运行要求
 
@@ -133,19 +132,21 @@ data/
 - `data/instances/<instanceId>/home/.openclaw/openclaw-weixin/accounts`
   保存微信配对账号信息
 
-## 当前实现说明
+## 容器部署
 
-当前版本仍是本地 JSON 存储 + 原生 Node HTTP 服务的 MVP，但已经覆盖了完整业务闭环，适合先验证：
+项目已提供可直接审阅和使用的容器化部署文件：
 
-- 多用户准入
-- 多实例创建
-- 模型配置写入
-- 微信绑定与二维码展示
-- 基础实例运维
+- 应用 Dockerfile：`./Dockerfile`
+- Compose 模板：`./compose.yaml`
 
-如果后续进入生产，建议继续补：
+启动方式：
 
-- 数据库替换 JSON 文件
-- 任务队列替换进程内异步任务
-- 审计日志
-- 更细粒度的管理员权限模型
+```bash
+docker compose up -d
+```
+
+部署要点：
+
+- 应用容器需要挂载 `/var/run/docker.sock`，用于创建用户实例容器
+- 业务数据存储在 `./data`
+- 若使用公开镜像部署，`OPENCLAW_RUNNER_IMAGE` 默认已指向 GHCR runner 镜像

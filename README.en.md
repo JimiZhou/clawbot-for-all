@@ -33,20 +33,9 @@ PUBLIC_ORIGIN=http://127.0.0.1:4300
 ADMIN_EMAIL=admin@example.com
 ADMIN_NAME=Platform Admin
 ADMIN_PASSWORD=ChangeMe123!
-OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
+OPENCLAW_RUNNER_IMAGE=ghcr.io/jimizhou/clawbot-openclaw-runner:latest
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
-
-## CI Image Build
-
-The repository now includes a GitHub Actions workflow that automatically builds the runner image:
-
-- Workflow: `.github/workflows/build-runner-image.yml`
-- Registry: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
-- Tags: `latest`, branch name, Git tag, and `sha-*`
-
-If you want deployments to consume the CI artifact directly, set
-`OPENCLAW_RUNNER_IMAGE` to the published GHCR image reference.
 
 Notes:
 
@@ -55,6 +44,16 @@ Notes:
 - If the admin email already exists, the service will still enforce `role=admin`
 - Newly created admin users get `mustChangePassword=true`
 - `PUBLIC_ORIGIN` is used to generate invite registration links
+
+## Image Publishing
+
+The repository includes a GitHub Actions workflow that publishes both images and writes tag-specific image references into GitHub Releases:
+
+- Workflow: `.github/workflows/publish-images.yml`
+- App image: `ghcr.io/<github-owner>/clawbot-for-all`
+- Runner image: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- Tags: `latest`, branch name, Git tag, and `sha-*`
+- Pushing a `v*` tag automatically updates the corresponding GitHub Release body with image pull references
 
 ## Requirements
 
@@ -133,19 +132,21 @@ Where:
 - `data/instances/<instanceId>/home/.openclaw/openclaw-weixin/accounts`
   stores paired WeChat account metadata
 
-## Current Status
+## Container Deployment
 
-This is still an MVP built on local JSON storage and a native Node HTTP server, but it already covers the main product loop:
+The repository includes deployable container assets:
 
-- multi-user onboarding
-- multi-instance creation
-- model config injection
-- WeChat pairing and QR rendering
-- basic instance operations
+- App Dockerfile: `./Dockerfile`
+- Compose template: `./compose.yaml`
 
-For production, the next logical steps are:
+Start with:
 
-- replace JSON with a real database
-- replace in-process async jobs with a task queue
-- add audit logs
-- add a finer-grained admin permission model
+```bash
+docker compose up -d
+```
+
+Deployment notes:
+
+- The app container must mount `/var/run/docker.sock` so it can create per-user instance containers
+- Persistent application data is stored in `./data`
+- For published-image deployments, `OPENCLAW_RUNNER_IMAGE` already points to the GHCR runner image by default

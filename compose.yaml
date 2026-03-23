@@ -1,0 +1,20 @@
+services:
+  clawbot:
+    image: ghcr.io/jimizhou/clawbot-for-all:latest
+    container_name: clawbot-for-all
+    restart: unless-stopped
+    ports:
+      - "4300:4300"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 4300
+      SESSION_TTL_DAYS: 14
+      PUBLIC_ORIGIN: http://127.0.0.1:4300
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_NAME: 平台管理员
+      ADMIN_PASSWORD: ChangeMe123!
+      OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:latest
+      OPENCLAW_WECHAT_BIND_TIMEOUT_MS: 600000
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -39,14 +39,28 @@ PUBLIC_ORIGIN=http://127.0.0.1:4300
 ADMIN_EMAIL=admin@example.com
 ADMIN_NAME=平台管理员
 ADMIN_PASSWORD=ChangeMe123!
-OPENCLAW_RUNNER_IMAGE=clawbot-openclaw-runner:local
+OPENCLAW_RUNNER_IMAGE=ghcr.io/jimizhou/clawbot-openclaw-runner:latest
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
 
-## CI Image
+## Images and Release
 
-GitHub Actions now builds the runner image automatically:
+GitHub Actions now publishes both images and writes tagged image references into GitHub Releases:
 
-- Workflow: `.github/workflows/build-runner-image.yml`
-- Registry: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
+- Workflow: `.github/workflows/publish-images.yml`
+- App image: `ghcr.io/<github-owner>/clawbot-for-all`
+- Runner image: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
 - Tags: `latest`, branch name, git tag, and `sha-*`
+
+## Container Deployment
+
+Use the included compose file:
+
+```bash
+docker compose up -d
+```
+
+Files:
+
+- App Dockerfile: `./Dockerfile`
+- Deployment template: `./compose.yaml`
