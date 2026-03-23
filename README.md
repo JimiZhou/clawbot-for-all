@@ -44,7 +44,7 @@ cd /opt/clawbot-for-all
 ```yaml
 services:
   clawbot:
-    image: ghcr.io/jimizhou/clawbot-for-all:v2026.3.23
+    image: ghcr.io/jimizhou/clawbot-for-all:latest
     container_name: clawbot-for-all
     restart: unless-stopped
     ports:
@@ -57,7 +57,7 @@ services:
       ADMIN_EMAIL: admin@example.com
       ADMIN_NAME: 平台管理员
       ADMIN_PASSWORD: ChangeMe123!
-      OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:v2026.3.23
+      OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:latest
       OPENCLAW_RUNNER_PULL_TIMEOUT_MS: 600000
       OPENCLAW_RUNNER_CPUS: "1.0"
       OPENCLAW_RUNNER_MEMORY: 1g
@@ -102,7 +102,7 @@ cd /opt/clawbot-for-all
 ```yaml
 services:
   clawbot:
-    image: ghcr.io/jimizhou/clawbot-for-all:v2026.3.23
+    image: ghcr.io/jimizhou/clawbot-for-all:latest
     container_name: clawbot-for-all
     restart: unless-stopped
     ports:
@@ -115,7 +115,7 @@ services:
       ADMIN_EMAIL: admin@example.com
       ADMIN_NAME: Platform Admin
       ADMIN_PASSWORD: ChangeMe123!
-      OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:v2026.3.23
+      OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:latest
       OPENCLAW_RUNNER_PULL_TIMEOUT_MS: 600000
       OPENCLAW_RUNNER_CPUS: "1.0"
       OPENCLAW_RUNNER_MEMORY: 1g
