@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
@@ -204,17 +205,16 @@ export function publicInstanceForHost(instance, requestHost) {
       message: "实例已就绪。",
       updatedAt: instance.updatedAt,
     },
-    model: {
-      providerId: instance.model.providerId,
-      modelId: instance.model.modelId,
-      apiMode: instance.model.apiMode,
-      baseUrl: instance.model.baseUrl,
-      apiKeyMasked: maskSecret(instance.model.apiKey),
-    },
-    plugins: instance.plugins || {
-      allow: [],
-      entries: {},
-    },
+    model: instance.model
+      ? {
+          providerId: instance.model.providerId,
+          modelId: instance.model.modelId,
+          apiMode: instance.model.apiMode,
+          baseUrl: instance.model.baseUrl,
+          apiKeyMasked: maskSecret(instance.model.apiKey),
+        }
+      : null,
+    plugins: withWechatPluginEnabled(instance.plugins),
     wechatBinding: instance.wechatBinding || {
       status: "idle",
       updatedAt: null,

@@ -8,6 +8,7 @@
 - 用户创建属于自己的 OpenClaw 实例，并查看创建进度
 - 自动写入每个实例的模型 API / Key 配置
 - 通过 Docker 拉起对应实例
+- Runner 镜像预装微信插件，用户实例启动后可直接拉起二维码绑定
 - 在用户实例容器内执行微信接入 CLI，并把二维码直接回传到前端
 - 查看实例日志、配置插件、重启网关
 
@@ -34,6 +35,7 @@ ADMIN_EMAIL=admin@example.com
 ADMIN_NAME=平台管理员
 ADMIN_PASSWORD=ChangeMe123!
 OPENCLAW_RUNNER_IMAGE=ghcr.io/jimizhou/clawbot-openclaw-runner:latest
+OPENCLAW_RUNNER_PULL_TIMEOUT_MS=600000
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
 
@@ -44,6 +46,8 @@ OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 - 若该邮箱已存在，系统会确保其角色为 `admin`
 - 新建管理员会自动带 `mustChangePassword=true`
 - `PUBLIC_ORIGIN` 用于生成邀请码注册链接
+- `OPENCLAW_RUNNER_PULL_TIMEOUT_MS`
+  用于控制 VPS 首次拉取 runner 镜像的最长等待时间
 
 ## 镜像发布
 
@@ -53,6 +57,8 @@ OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 - 应用镜像：`ghcr.io/<github-owner>/clawbot-for-all`
 - Runner 镜像：`ghcr.io/<github-owner>/clawbot-openclaw-runner`
 - 默认标签：`latest`、分支名、Git Tag、`sha-*`
+- Runner 镜像额外写入 `io.clawbot.openclaw.version` 标签，便于在 VPS 和管理台核对 OpenClaw 版本
+- Server 日志会落盘到 `data/logs/server.log`，并可在管理员后台直接查看
 - 当推送 `v*` 标签时，会自动把对应镜像地址写入 GitHub Release
 
 ## 运行要求
@@ -60,7 +66,7 @@ OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 - Node.js 22+
 - Docker Desktop / Docker Engine
 - 允许当前机器执行：
-  - `docker build`
+  - `docker pull`
   - `docker run`
   - `docker rm`
   - `docker exec`
@@ -105,10 +111,11 @@ OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 
 1. 确认该用户实例容器已运行
 2. 进入对应 OpenClaw 容器
-3. 在容器内执行微信接入命令
-4. 从命令输出中识别二维码图片 / data URL / ASCII 二维码
-5. 将二维码直接展示到前端
-6. 读取实例目录内保存的微信账号文件，展示已配对信息
+3. 检查并启用 runner 镜像内预装的微信插件
+4. 在容器内直接执行微信接入命令
+5. 从命令输出中识别二维码图片 / data URL / ASCII 二维码
+6. 将二维码直接展示到前端
+7. 读取实例目录内保存的微信账号文件，展示已配对信息
 
 ## 数据结构
 
@@ -150,3 +157,5 @@ docker compose up -d
 - 应用容器需要挂载 `/var/run/docker.sock`，用于创建用户实例容器
 - 业务数据存储在 `./data`
 - 若使用公开镜像部署，`OPENCLAW_RUNNER_IMAGE` 默认已指向 GHCR runner 镜像
+- 管理员可在后台“镜像管理”页查看 runner 镜像是否已预热、本地 digest 与内置 OpenClaw 版本
+- 管理员可在后台“服务日志”页查看最近 server 日志，无需 SSH 上机排查

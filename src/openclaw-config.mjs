@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ensureDir, nowIso, slugify, writeJsonFile } from "./utils.mjs";
+import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export const INSTANCE_BASE_PORT = 19000;
 
@@ -38,17 +39,16 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
       message: "正在创建实例目录与默认配置。",
       updatedAt: createdAt,
     },
-    model: {
-      providerId: model.providerId,
-      modelId: model.modelId,
-      apiMode: model.apiMode,
-      baseUrl: model.baseUrl,
-      apiKey: model.apiKey,
-    },
-    plugins: {
-      allow: [],
-      entries: {},
-    },
+    model: model
+      ? {
+          providerId: model.providerId,
+          modelId: model.modelId,
+          apiMode: model.apiMode,
+          baseUrl: model.baseUrl,
+          apiKey: model.apiKey,
+        }
+      : null,
+    plugins: withWechatPluginEnabled(),
     wechatBinding: {
       status: "idle",
       updatedAt: null,
@@ -68,10 +68,7 @@ export function ensureInstanceLayout(paths) {
 }
 
 export function buildOpenClawConfig(instance) {
-  const providerId = instance.model.providerId;
-  const modelId = instance.model.modelId;
-
-  return {
+  const config = {
     gateway: {
       bind: "lan",
       port: 18789,
@@ -83,15 +80,22 @@ export function buildOpenClawConfig(instance) {
         enabled: true,
       },
     },
-    agents: {
+  };
+
+  if (instance.model) {
+    const providerId = instance.model.providerId;
+    const modelId = instance.model.modelId;
+
+    config.agents = {
       defaults: {
         workspace: "/workspace",
         model: {
           primary: `${providerId}/${modelId}`,
         },
       },
-    },
-    models: {
+    };
+
+    config.models = {
       mode: "merge",
       providers: {
         [providerId]: {
@@ -116,18 +120,25 @@ export function buildOpenClawConfig(instance) {
           ],
         },
       },
-    },
-    ...(instance.plugins && (instance.plugins.allow?.length || Object.keys(instance.plugins.entries || {}).length)
-      ? {
-          plugins: {
-            ...(instance.plugins.allow?.length ? { allow: instance.plugins.allow } : {}),
-            ...(Object.keys(instance.plugins.entries || {}).length
-              ? { entries: instance.plugins.entries }
-              : {}),
-          },
-        }
-      : {}),
-  };
+    };
+  } else {
+    config.agents = {
+      defaults: {
+        workspace: "/workspace",
+      },
+    };
+  }
+
+  const normalizedPlugins = withWechatPluginEnabled(instance.plugins);
+
+  if (normalizedPlugins.allow?.length || Object.keys(normalizedPlugins.entries || {}).length) {
+    config.plugins = {
+      ...(normalizedPlugins.allow?.length ? { allow: normalizedPlugins.allow } : {}),
+      ...(Object.keys(normalizedPlugins.entries || {}).length ? { entries: normalizedPlugins.entries } : {}),
+    };
+  }
+
+  return config;
 }
 
 export function writeInstanceFiles(dataDir, instance) {

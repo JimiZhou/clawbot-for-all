@@ -42,6 +42,21 @@ jobs:
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           echo "image=ghcr.io/${owner}/${{ matrix.image_name }}" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare runner metadata
+        id: runner_meta
+        shell: bash
+        run: |
+          if [ "${{ matrix.image_name }}" = "clawbot-openclaw-runner" ]; then
+            openclaw_version="$(npm view openclaw version)"
+            echo "openclaw_version=${openclaw_version}" >> "$GITHUB_OUTPUT"
+            echo "build_args=OPENCLAW_VERSION=${openclaw_version}" >> "$GITHUB_OUTPUT"
+            printf 'extra_labels<<EOF\nio.clawbot.openclaw.version=%s\nEOF\n' "$openclaw_version" >> "$GITHUB_OUTPUT"
+          else
+            echo "openclaw_version=" >> "$GITHUB_OUTPUT"
+            echo "build_args=" >> "$GITHUB_OUTPUT"
+            printf 'extra_labels<<EOF\nEOF\n' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -68,7 +83,10 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            ${{ steps.runner_meta.outputs.extra_labels }}
+          build-args: ${{ steps.runner_meta.outputs.build_args }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

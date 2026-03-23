@@ -1,13 +1,34 @@
-import path from "node:path";
 import { spawn } from "node:child_process";
 import {
   nowIso,
 } from "./utils.mjs";
+import { WECHAT_CHANNEL_ID, WECHAT_PLUGIN_SPEC } from "./wechat-plugin.mjs";
 
-const RUNNER_IMAGE = process.env.OPENCLAW_RUNNER_IMAGE || "clawbot-openclaw-runner:local";
+const RUNNER_IMAGE = process.env.OPENCLAW_RUNNER_IMAGE || "ghcr.io/jimizhou/clawbot-openclaw-runner:latest";
+const RUNNER_PULL_TIMEOUT_MS = Number(process.env.OPENCLAW_RUNNER_PULL_TIMEOUT_MS || 10 * 60 * 1000);
 const WECHAT_BIND_TIMEOUT_MS = Number(process.env.OPENCLAW_WECHAT_BIND_TIMEOUT_MS || 10 * 60 * 1000);
-const WECHAT_PLUGIN_SPEC = "@tencent-weixin/openclaw-weixin";
-const WECHAT_CHANNEL_ID = "openclaw-weixin";
+const RUNNER_IMAGE_INSPECT_TIMEOUT_MS = 15 * 1000;
+
+const runnerImageState = {
+  image: RUNNER_IMAGE,
+  status: "idle",
+  source: "unknown",
+  message: "等待检查 runner 镜像。",
+  imageId: "",
+  repoTags: [],
+  repoDigests: [],
+  createdAt: null,
+  size: 0,
+  localAvailable: false,
+  openclawVersion: "",
+  labels: {},
+  lastError: "",
+  startedAt: null,
+  updatedAt: nowIso(),
+};
+
+let runnerImageTask = null;
+let runtimeLogger = null;
 
 function tailSnippet(output, maxLength = 2000) {
   const text = String(output || "");
@@ -82,25 +103,230 @@ function extractQrLink(output) {
   return directMatch ? directMatch[0] : "";
 }
 
-export async function ensureRunnerImage(projectRoot) {
-  const inspect = await runProcess("docker", ["image", "inspect", RUNNER_IMAGE]);
-  if (inspect.code === 0) {
-    return;
-  }
+function logRuntime(level, message, meta = undefined) {
+  runtimeLogger?.(level, message, meta);
+}
 
-  const dockerfilePath = path.join(projectRoot, "containers", "openclaw-runner", "Dockerfile");
-  const build = await runProcess("docker", ["build", "-t", RUNNER_IMAGE, "-f", dockerfilePath, "."], {
-    cwd: projectRoot,
-    timeoutMs: 10 * 60 * 1000,
+export function setRuntimeLogger(logger) {
+  runtimeLogger = typeof logger === "function" ? logger : null;
+}
+
+function patchRunnerImageState(patch = {}) {
+  Object.assign(runnerImageState, patch, {
+    image: RUNNER_IMAGE,
+    updatedAt: nowIso(),
+  });
+}
+
+async function inspectRunnerImage() {
+  const result = await runProcess("docker", ["image", "inspect", RUNNER_IMAGE, "--format", "{{json .}}"], {
+    timeoutMs: RUNNER_IMAGE_INSPECT_TIMEOUT_MS,
   });
 
-  if (build.timedOut) {
-    throw new Error("构建 OpenClaw 运行镜像超时（10 分钟）。请检查 Docker 拉取基础镜像和 npm 安装是否可访问外网。");
+  if (result.timedOut) {
+    throw new Error(`检查 runner 镜像超时：${RUNNER_IMAGE}`);
   }
 
-  if (build.code !== 0) {
-    throw new Error(`构建 OpenClaw 运行镜像失败:\n${build.stderr || build.stdout}`);
+  if (result.code !== 0) {
+    return null;
   }
+
+  const raw = JSON.parse(result.stdout.trim());
+  const labels = raw?.Config?.Labels && typeof raw.Config.Labels === "object" ? raw.Config.Labels : {};
+
+  return {
+    image: RUNNER_IMAGE,
+    imageId: raw?.Id || "",
+    repoTags: Array.isArray(raw?.RepoTags) ? raw.RepoTags : [],
+    repoDigests: Array.isArray(raw?.RepoDigests) ? raw.RepoDigests : [],
+    createdAt: raw?.Created || null,
+    size: Number(raw?.Size || 0),
+    labels,
+    openclawVersion: labels["io.clawbot.openclaw.version"] || "",
+  };
+}
+
+async function syncRunnerImageStateFromLocal({ source = "local", message = "Runner 镜像已就绪。", startedAt = null } = {}) {
+  const image = await inspectRunnerImage();
+  if (!image) {
+    patchRunnerImageState({
+      status: "missing",
+      source: "missing",
+      message: "本地尚未找到 runner 镜像。",
+      imageId: "",
+      repoTags: [],
+      repoDigests: [],
+      createdAt: null,
+      size: 0,
+      localAvailable: false,
+      openclawVersion: "",
+      labels: {},
+      lastError: "",
+      startedAt,
+    });
+    return null;
+  }
+
+  patchRunnerImageState({
+    status: "ready",
+    source,
+    message,
+    imageId: image.imageId,
+    repoTags: image.repoTags,
+    repoDigests: image.repoDigests,
+    createdAt: image.createdAt,
+    size: image.size,
+    localAvailable: true,
+    openclawVersion: image.openclawVersion,
+    labels: image.labels,
+    lastError: "",
+    startedAt,
+  });
+
+  return image;
+}
+
+async function pullRunnerImage({ trigger = "manual", force = false } = {}) {
+  if (runnerImageTask) {
+    return runnerImageTask;
+  }
+
+  const startedAt = nowIso();
+  runnerImageTask = (async () => {
+    if (!force) {
+      const local = await syncRunnerImageStateFromLocal({
+        source: "local",
+        message: trigger === "startup"
+          ? "Server 启动时检测到本地已存在 runner 镜像。"
+          : "Runner 镜像已在本地缓存，可直接启动实例。",
+        startedAt,
+      });
+      if (local) {
+        logRuntime("info", `Runner 镜像已就绪：${RUNNER_IMAGE}`, {
+          source: trigger === "startup" ? "startup-local-cache" : "local-cache",
+          openclawVersion: local.openclawVersion,
+          imageId: local.imageId,
+        });
+        return local;
+      }
+    }
+
+    logRuntime("info", `开始拉取 runner 镜像：${RUNNER_IMAGE}`, {
+      trigger,
+      force,
+    });
+
+    patchRunnerImageState({
+      status: "pulling",
+      source: force ? "refresh" : trigger,
+      message: force ? "管理员触发了 runner 镜像刷新，正在拉取最新镜像。" : "正在拉取 runner 镜像，请稍候。",
+      startedAt,
+      lastError: "",
+    });
+
+    const pull = await runProcess("docker", ["pull", RUNNER_IMAGE], {
+      timeoutMs: RUNNER_PULL_TIMEOUT_MS,
+    });
+
+    if (pull.timedOut) {
+      const error = new Error(
+        `拉取 OpenClaw runner 镜像超时（${Math.round(RUNNER_PULL_TIMEOUT_MS / 60000)} 分钟）：${RUNNER_IMAGE}。请检查 VPS 到 GHCR 的网络连通性，或通过 OPENCLAW_RUNNER_PULL_TIMEOUT_MS 调大超时时间。`,
+      );
+      patchRunnerImageState({
+        status: "error",
+        source: force ? "refresh" : trigger,
+        message: error.message,
+        lastError: error.message,
+        localAvailable: false,
+        startedAt,
+      });
+      logRuntime("error", error.message, {
+        image: RUNNER_IMAGE,
+        trigger,
+      });
+      throw error;
+    }
+
+    if (pull.code !== 0) {
+      const errorMessage =
+        `拉取 OpenClaw runner 镜像失败：${RUNNER_IMAGE}\n${pull.stderr || pull.stdout}\n请确认 OPENCLAW_RUNNER_IMAGE 配置正确，且当前服务器已具备拉取 GHCR 镜像的权限。`;
+      patchRunnerImageState({
+        status: "error",
+        source: force ? "refresh" : trigger,
+        message: errorMessage,
+        lastError: errorMessage,
+        localAvailable: false,
+        startedAt,
+      });
+      logRuntime("error", errorMessage, {
+        image: RUNNER_IMAGE,
+        trigger,
+      });
+      throw new Error(errorMessage);
+    }
+
+    const pulledImage = await syncRunnerImageStateFromLocal({
+      source: force ? "refresh" : "pull",
+      message: force ? "Runner 镜像已刷新完成。" : "Runner 镜像已拉取完成，可直接创建实例。",
+      startedAt,
+    });
+
+    if (!pulledImage) {
+      const error = new Error(`Runner 镜像拉取后仍无法在本地读取：${RUNNER_IMAGE}`);
+      patchRunnerImageState({
+        status: "error",
+        source: force ? "refresh" : trigger,
+        message: error.message,
+        lastError: error.message,
+        localAvailable: false,
+        startedAt,
+      });
+      logRuntime("error", error.message, {
+        image: RUNNER_IMAGE,
+        trigger,
+      });
+      throw error;
+    }
+
+    logRuntime("info", `Runner 镜像已拉取完成：${RUNNER_IMAGE}`, {
+      trigger,
+      openclawVersion: pulledImage.openclawVersion,
+      imageId: pulledImage.imageId,
+      repoDigests: pulledImage.repoDigests,
+    });
+
+    return pulledImage;
+  })();
+
+  try {
+    return await runnerImageTask;
+  } finally {
+    runnerImageTask = null;
+  }
+}
+
+export async function ensureRunnerImage() {
+  await pullRunnerImage({ trigger: "ensure" });
+}
+
+export function warmRunnerImageInBackground() {
+  void pullRunnerImage({ trigger: "startup" }).catch((error) => {
+    logRuntime("error", `[runner-image] ${error.message || error}`);
+  });
+}
+
+export async function refreshRunnerImage() {
+  await pullRunnerImage({ trigger: "admin", force: true });
+  return getRunnerImageStatus();
+}
+
+export function getRunnerImageStatus() {
+  return {
+    ...runnerImageState,
+    repoTags: [...runnerImageState.repoTags],
+    repoDigests: [...runnerImageState.repoDigests],
+    labels: { ...runnerImageState.labels },
+  };
 }
 
 export async function inspectInstance(instance) {
@@ -127,7 +353,7 @@ export async function inspectInstance(instance) {
 }
 
 export async function startInstance(projectRoot, paths, instance) {
-  await ensureRunnerImage(projectRoot);
+  await ensureRunnerImage();
   await stopInstance(instance);
 
   const result = await runProcess("docker", [
@@ -188,6 +414,31 @@ export async function execInstanceShell(instance, command, options = {}) {
   return `${result.stdout}${result.stderr}`.trim();
 }
 
+export async function getInstanceStats(instance) {
+  const result = await runProcess(
+    "docker",
+    ["stats", "--format", "{{json .}}", "--no-stream", instance.containerName],
+    { timeoutMs: 5000 },
+  );
+
+  if (result.timedOut || result.code !== 0) {
+    return null;
+  }
+
+  try {
+    const raw = JSON.parse(result.stdout.trim());
+    return {
+      cpuPercent: raw.CPUPerc || "0.00%",
+      memUsage: raw.MemUsage || "0B / 0B",
+      memPercent: raw.MemPerc || "0.00%",
+      netIO: raw.NetIO || "0B / 0B",
+      pids: raw.PIDs || "0",
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function getInstanceLogs(instance, tail = 200) {
   const result = await runProcess("docker", ["logs", "--tail", String(tail), instance.containerName], {
     timeoutMs: 30 * 1000,
@@ -219,14 +470,8 @@ function buildWechatCommand() {
 set -e
 PLUGIN_DIR="/var/lib/openclaw/.openclaw/extensions/${WECHAT_CHANNEL_ID}"
 if [ ! -d "$PLUGIN_DIR" ]; then
-  if openclaw plugins install "${WECHAT_PLUGIN_SPEC}"; then
-    :
-  else
-    openclaw plugins update "${WECHAT_CHANNEL_ID}"
-  fi
-  openclaw config set plugins.entries.${WECHAT_CHANNEL_ID}.enabled true
-  openclaw gateway restart
-  sleep 4
+  echo "Runner 镜像内未找到预装微信插件：${WECHAT_PLUGIN_SPEC}" >&2
+  exit 1
 fi
 openclaw config set plugins.entries.${WECHAT_CHANNEL_ID}.enabled true
 openclaw channels login --channel ${WECHAT_CHANNEL_ID} --verbose
@@ -271,7 +516,7 @@ function inferWechatState(output, current = {}) {
     next.status = "connected";
   }
 
-  if (/Downloading |Extracting |Installing |正在启动微信扫码登录/i.test(output) && !next.qrPayload) {
+  if (/Checking |Starting |正在检查微信插件|正在启动微信扫码登录/i.test(output) && !next.qrPayload) {
     next.status = "starting";
   }
 

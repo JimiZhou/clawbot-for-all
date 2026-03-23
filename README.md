@@ -15,6 +15,7 @@ Multi-tenant OpenClaw control plane with invite-only registration, per-user inst
 - Admin bootstrap from environment variables
 - Forced password change on first admin login
 - Per-user OpenClaw instance creation with provisioning progress
+- Runner image with preinstalled WeChat plugin for immediate QR pairing
 - WeChat QR pairing rendered directly in web UI
 - Instance logs, model config, plugin config, gateway restart
 
@@ -40,6 +41,7 @@ ADMIN_EMAIL=admin@example.com
 ADMIN_NAME=平台管理员
 ADMIN_PASSWORD=ChangeMe123!
 OPENCLAW_RUNNER_IMAGE=ghcr.io/jimizhou/clawbot-openclaw-runner:latest
+OPENCLAW_RUNNER_PULL_TIMEOUT_MS=600000
 OPENCLAW_WECHAT_BIND_TIMEOUT_MS=600000
 ```
 
@@ -51,6 +53,8 @@ GitHub Actions now publishes both images and writes tagged image references into
 - App image: `ghcr.io/<github-owner>/clawbot-for-all`
 - Runner image: `ghcr.io/<github-owner>/clawbot-openclaw-runner`
 - Tags: `latest`, branch name, git tag, and `sha-*`
+- Runner image labels include `io.clawbot.openclaw.version` for OpenClaw version tracking
+- Server logs are written to `data/logs/server.log` and can be viewed in the admin console
 
 ## Container Deployment
 
@@ -64,3 +68,5 @@ Files:
 
 - App Dockerfile: `./Dockerfile`
 - Deployment template: `./compose.yaml`
+- Admin console can inspect runner image cache, digest, and embedded OpenClaw version after startup
+- Admin console can also inspect recent server logs without SSH access

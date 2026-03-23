@@ -1,5 +1,6 @@
 import path from "node:path";
 import { ensureDir, nowIso, randomId, readJsonFile, writeJsonFile } from "./utils.mjs";
+import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 const DB_FILENAME = "db.json";
 
@@ -11,6 +12,7 @@ function createEmptyDatabase() {
     sessions: [],
     instances: [],
     invites: [],
+    modelPresets: [],
   };
 }
 
@@ -25,18 +27,16 @@ function normalizeUser(user) {
 
 function normalizeInstance(instance) {
   return {
-    provisioning: {
+    ...instance,
+    provisioning: instance.provisioning || {
       status: "ready",
       percent: 100,
       stage: "ready",
       message: "实例已就绪。",
       updatedAt: instance.updatedAt || instance.createdAt || nowIso(),
     },
-    plugins: {
-      allow: [],
-      entries: {},
-    },
-    wechatBinding: {
+    plugins: withWechatPluginEnabled(instance.plugins),
+    wechatBinding: instance.wechatBinding || {
       status: "idle",
       updatedAt: null,
       qrMode: null,
@@ -44,7 +44,6 @@ function normalizeInstance(instance) {
       outputSnippet: "",
       pairedAccounts: [],
     },
-    ...instance,
   };
 }
 
@@ -69,6 +68,7 @@ export function normalizeDatabase(database) {
     ? normalized.instances.map(normalizeInstance)
     : [];
   normalized.invites = Array.isArray(normalized.invites) ? normalized.invites.map(normalizeInvite) : [];
+  normalized.modelPresets = Array.isArray(normalized.modelPresets) ? normalized.modelPresets : [];
   normalized.version = 2;
   return normalized;
 }

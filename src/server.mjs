@@ -8,15 +8,22 @@ import {
   getInstancePaths,
   writeInstanceFiles,
 } from "./openclaw-config.mjs";
+import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 import {
   execInstanceShell,
+  getRunnerImageStatus,
   getInstanceLogs,
+  getInstanceStats,
   inspectInstance,
+  refreshRunnerImage,
   restartInstance,
+  setRuntimeLogger,
   startInstance,
   startWechatBindJob,
   stopInstance,
+  warmRunnerImageInBackground,
 } from "./runtime.mjs";
+import { getServerLogPath, initServerLogger, logServer, readServerLogs } from "./server-log.mjs";
 import { createSessionRecord, ensureDatabase, loadDatabase, mutateDatabase } from "./store.mjs";
 import {
   buildRequestOrigin,
@@ -55,6 +62,8 @@ const adminPassword = String(rawAdminPassword);
 
 ensureDir(dataDir);
 ensureDatabase(dataDir);
+initServerLogger(dataDir);
+setRuntimeLogger(logServer);
 
 const wechatJobs = new Map();
 const provisioningJobs = new Map();
@@ -157,7 +166,7 @@ function sanitizePluginsPayload(payload, existingPlugins = null) {
     next.entries = payload.entries;
   }
 
-  return next;
+  return withWechatPluginEnabled(next);
 }
 
 function ensureAdminAccount() {
@@ -196,6 +205,10 @@ function ensureAdminAccount() {
 }
 
 ensureAdminAccount();
+logServer("info", "Server 初始化完成。", {
+  dataDir,
+  serverLogPath: getServerLogPath(),
+});
 
 function resolveRequestHost(request) {
   return request.headers["x-forwarded-host"] || request.headers.host || "";
@@ -437,6 +450,7 @@ function startProvisioningJob(instanceId) {
         target.updatedAt = nowIso();
       });
     } catch (error) {
+      logServer("error", `实例创建失败：${instanceId}`, error);
       updateProvisioning(instanceId, {
         status: "error",
         percent: 100,
@@ -715,6 +729,41 @@ async function handleCreateInvite(request, response) {
   });
 }
 
+async function handleRevokeInvite(request, response, inviteId) {
+  const user = requireUser(request, response, { requireAdmin: true });
+  if (!user) {
+    return;
+  }
+
+  const database = loadDatabase(dataDir);
+  const invite = database.invites.find((record) => record.id === inviteId);
+  if (!invite) {
+    sendJson(response, 404, { error: "邀请码不存在。" });
+    return;
+  }
+
+  if (invite.revoked) {
+    sendJson(response, 200, {
+      invite: publicInvite(invite, resolveRequestOrigin(request)),
+    });
+    return;
+  }
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.invites.find((record) => record.id === inviteId);
+    if (!target) {
+      return;
+    }
+
+    target.revoked = true;
+  });
+
+  const latest = loadDatabase(dataDir).invites.find((record) => record.id === inviteId) || invite;
+  sendJson(response, 200, {
+    invite: publicInvite(latest, resolveRequestOrigin(request)),
+  });
+}
+
 async function handleListInstances(request, response) {
   const user = requireUser(request, response);
   if (!user) {
@@ -746,28 +795,56 @@ async function handleCreateInstance(request, response) {
     return;
   }
 
-  let model;
-  try {
-    model = sanitizeModelPayload(body);
-  } catch (error) {
-    sendJson(response, 400, { error: error.message });
-    return;
+  let model = null;
+  if (body.presetId) {
+    const database0 = loadDatabase(dataDir);
+    const preset = (database0.modelPresets || []).find((p) => p.id === body.presetId);
+    if (!preset) {
+      sendJson(response, 400, { error: "所选模型预设不存在。" });
+      return;
+    }
+    model = {
+      providerId: preset.providerId,
+      modelId: preset.modelId,
+      apiMode: preset.apiMode,
+      baseUrl: preset.baseUrl || "",
+      apiKey: preset.apiKey || "",
+    };
+  } else if (body.providerId || body.modelId || body.apiKey) {
+    try {
+      model = sanitizeModelPayload(body);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
   }
 
   const database = loadDatabase(dataDir);
+
+  const existingCount = database.instances.filter((record) => record.userId === user.id).length;
+  if (existingCount >= 1) {
+    sendJson(response, 409, { error: "每个用户只能创建一个实例。" });
+    return;
+  }
+
   const nextIndex = database.instances.length + 1;
-  const instance = createInstanceRecord({
-    userId: user.id,
-    name,
-    model,
-    nextIndex,
-  });
+      const instance = createInstanceRecord({
+        userId: user.id,
+        name,
+        model,
+        nextIndex,
+      });
 
   mutateDatabase(dataDir, (draft) => {
     draft.instances.push(instance);
   });
 
   startProvisioningJob(instance.id);
+  logServer("info", `用户已提交实例创建：${instance.id}`, {
+    userId: user.id,
+    instanceName: instance.name,
+    runnerImage: getRunnerImageStatus().image,
+  });
 
   sendJson(response, 202, {
     instance: publicInstanceForHost(instance, resolveRequestHost(request)),
@@ -795,11 +872,26 @@ async function handleUpdateModel(request, response, instanceId) {
     return;
   }
 
-  try {
-    instance.model = sanitizeModelPayload(body, instance.model);
-  } catch (error) {
-    sendJson(response, 400, { error: error.message });
-    return;
+  if (body.presetId) {
+    const preset = (database.modelPresets || []).find((p) => p.id === body.presetId);
+    if (!preset) {
+      sendJson(response, 400, { error: "所选模型预设不存在。" });
+      return;
+    }
+    instance.model = {
+      providerId: preset.providerId,
+      modelId: preset.modelId,
+      apiMode: preset.apiMode,
+      baseUrl: preset.baseUrl || "",
+      apiKey: preset.apiKey || "",
+    };
+  } else {
+    try {
+      instance.model = sanitizeModelPayload(body, instance.model);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
   }
 
   instance.updatedAt = nowIso();
@@ -1026,7 +1118,7 @@ async function handleWechatBind(request, response, instanceId) {
     updatedAt: nowIso(),
     qrMode: null,
     qrPayload: "",
-    outputSnippet: "已进入容器，正在安装 / 更新微信插件并拉起扫码登录流程。",
+    outputSnippet: "已进入容器，正在检查预装微信插件并拉起扫码登录流程。",
   });
 
   const job = startWechatBindJob(instance, {
@@ -1110,6 +1202,15 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const inviteMatch = pathname.match(/^\/api\/invites\/([^/]+)\/revoke$/);
+    if (inviteMatch) {
+      const [, inviteId] = inviteMatch;
+      if (request.method === "POST") {
+        await handleRevokeInvite(request, response, inviteId);
+        return;
+      }
+    }
+
     if (request.method === "GET" && pathname === "/api/instances") {
       await handleListInstances(request, response);
       return;
@@ -1120,7 +1221,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|logs|plugins|restart-gateway)$/);
+    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|logs|plugins|restart-gateway|stats)$/);
     if (instanceMatch) {
       const [, instanceId, action] = instanceMatch;
 
@@ -1158,10 +1259,206 @@ const server = http.createServer(async (request, response) => {
         await handleInstanceLogs(request, response, instanceId, url);
         return;
       }
+
+      if (request.method === "GET" && action === "stats") {
+        const user = requireUser(request, response);
+        if (!user) return;
+        const instance = findOwnedInstance(user, instanceId);
+        if (!instance) {
+          sendJson(response, 404, { error: "实例不存在。" });
+          return;
+        }
+        const runtimeState = await inspectInstance(instance);
+        if (!runtimeState.running) {
+          sendJson(response, 200, { stats: null });
+          return;
+        }
+        const stats = await getInstanceStats(instance);
+        sendJson(response, 200, { stats });
+        return;
+      }
+    }
+
+    if (request.method === "GET" && pathname === "/api/admin/users") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      const database = loadDatabase(dataDir);
+      const users = database.users.map((record) => publicUser(record));
+      sendJson(response, 200, { users });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/api/admin/instances") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      const database = loadDatabase(dataDir);
+      const usersById = Object.fromEntries(database.users.map((record) => [record.id, record]));
+      await Promise.all(database.instances.map((instance) => refreshInstanceRuntimeState(instance.id)));
+      const latestDatabase = loadDatabase(dataDir);
+      const statsResults = await Promise.all(
+        latestDatabase.instances.map(async (record) => {
+          if (record.status === "running") {
+            return getInstanceStats(record);
+          }
+          return null;
+        }),
+      );
+      const instances = latestDatabase.instances.map((record, index) => ({
+        ...publicInstanceForHost(record, resolveRequestHost(request)),
+        userName: usersById[record.userId]?.name || "未知用户",
+        userId: record.userId,
+        stats: statsResults[index],
+      }));
+      sendJson(response, 200, { instances });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/api/admin/runner-image") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      sendJson(response, 200, { image: getRunnerImageStatus() });
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/admin/runner-image/refresh") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      logServer("info", "管理员手动刷新 runner 镜像。", {
+        adminUserId: user.id,
+        image: getRunnerImageStatus().image,
+      });
+      const image = await refreshRunnerImage();
+      sendJson(response, 200, { image });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/api/admin/server-logs") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      const tail = Math.max(50, Math.min(2000, Number(url.searchParams.get("tail") || 400)));
+      const logs = readServerLogs(tail);
+      sendJson(response, 200, { logs: { ...logs, tail } });
+      return;
+    }
+
+    const adminUserMatch = pathname.match(/^\/api\/admin\/users\/([^/]+)$/);
+    if (adminUserMatch && request.method === "DELETE") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) {
+        return;
+      }
+
+      const [, targetUserId] = adminUserMatch;
+      const database = loadDatabase(dataDir);
+      const targetUser = database.users.find((record) => record.id === targetUserId);
+      if (!targetUser) {
+        sendJson(response, 404, { error: "用户不存在。" });
+        return;
+      }
+
+      if (targetUser.role === "admin") {
+        sendJson(response, 403, { error: "不能删除管理员账号。" });
+        return;
+      }
+
+      const userInstances = database.instances.filter((record) => record.userId === targetUserId);
+      for (const instance of userInstances) {
+        try {
+          await stopInstance(instance);
+        } catch {}
+      }
+
+      mutateDatabase(dataDir, (draft) => {
+        draft.instances = draft.instances.filter((record) => record.userId !== targetUserId);
+        draft.sessions = draft.sessions.filter((record) => record.userId !== targetUserId);
+        draft.users = draft.users.filter((record) => record.id !== targetUserId);
+      });
+
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+
+    if (request.method === "GET" && pathname === "/api/model-presets") {
+      const user = requireUser(request, response);
+      if (!user) return;
+      const database = loadDatabase(dataDir);
+      const presets = (database.modelPresets || []).map((p) => ({
+        id: p.id,
+        name: p.name,
+        providerId: p.providerId,
+        modelId: p.modelId,
+        apiMode: p.apiMode,
+        baseUrl: p.baseUrl || "",
+        createdAt: p.createdAt,
+      }));
+      sendJson(response, 200, { presets });
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/admin/model-presets") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) return;
+      let body;
+      try { body = await parseRequestBody(request); } catch {
+        sendJson(response, 400, { error: "请求体不是合法 JSON。" });
+        return;
+      }
+      const name = sanitizeName(body.name);
+      if (!name) { sendJson(response, 400, { error: "预设名称不能为空。" }); return; }
+      let model;
+      try { model = sanitizeModelPayload(body); } catch (error) {
+        sendJson(response, 400, { error: error.message });
+        return;
+      }
+      const preset = {
+        id: `preset_${Date.now().toString(36)}`,
+        name,
+        ...model,
+        createdAt: nowIso(),
+      };
+      mutateDatabase(dataDir, (draft) => {
+        if (!draft.modelPresets) draft.modelPresets = [];
+        draft.modelPresets.push(preset);
+      });
+      sendJson(response, 201, { preset: { ...preset, apiKey: undefined } });
+      return;
+    }
+
+    const presetDeleteMatch = pathname.match(/^\/api\/admin\/model-presets\/([^/]+)$/);
+    if (presetDeleteMatch && request.method === "DELETE") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) return;
+      const [, presetId] = presetDeleteMatch;
+      const database = loadDatabase(dataDir);
+      if (!(database.modelPresets || []).some((p) => p.id === presetId)) {
+        sendJson(response, 404, { error: "预设不存在。" });
+        return;
+      }
+      mutateDatabase(dataDir, (draft) => {
+        draft.modelPresets = (draft.modelPresets || []).filter((p) => p.id !== presetId);
+      });
+      sendJson(response, 200, { ok: true });
+      return;
     }
 
     serveStaticFile(pathname, response);
   } catch (error) {
+    logServer("error", `请求处理失败：${request.method} ${request.url || ""}`, error);
     sendJson(response, 500, {
       error: String(error.message || error),
     });
@@ -1169,5 +1466,9 @@ const server = http.createServer(async (request, response) => {
 });
 
 server.listen(port, host, () => {
-  console.log(`Clawbot for All running at http://${host}:${port}`);
+  logServer("info", `Clawbot for All running at http://${host}:${port}`);
+  logServer("info", "开始后台预热 runner 镜像。", {
+    image: getRunnerImageStatus().image,
+  });
+  warmRunnerImageInBackground();
 });
