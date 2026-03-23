@@ -8,6 +8,8 @@ const RUNNER_IMAGE = process.env.OPENCLAW_RUNNER_IMAGE || "ghcr.io/jimizhou/claw
 const RUNNER_PULL_TIMEOUT_MS = Number(process.env.OPENCLAW_RUNNER_PULL_TIMEOUT_MS || 10 * 60 * 1000);
 const WECHAT_BIND_TIMEOUT_MS = Number(process.env.OPENCLAW_WECHAT_BIND_TIMEOUT_MS || 10 * 60 * 1000);
 const RUNNER_IMAGE_INSPECT_TIMEOUT_MS = 15 * 1000;
+const RUNNER_CPUS = String(process.env.OPENCLAW_RUNNER_CPUS || "").trim();
+const RUNNER_MEMORY = String(process.env.OPENCLAW_RUNNER_MEMORY || "").trim();
 
 const runnerImageState = {
   image: RUNNER_IMAGE,
@@ -109,6 +111,20 @@ function logRuntime(level, message, meta = undefined) {
 
 export function setRuntimeLogger(logger) {
   runtimeLogger = typeof logger === "function" ? logger : null;
+}
+
+function buildRunnerResourceArgs() {
+  const args = [];
+
+  if (RUNNER_CPUS) {
+    args.push("--cpus", RUNNER_CPUS);
+  }
+
+  if (RUNNER_MEMORY) {
+    args.push("--memory", RUNNER_MEMORY);
+  }
+
+  return args;
 }
 
 function patchRunnerImageState(patch = {}) {
@@ -356,6 +372,8 @@ export async function startInstance(projectRoot, paths, instance) {
   await ensureRunnerImage();
   await stopInstance(instance);
 
+  const resourceArgs = buildRunnerResourceArgs();
+
   const result = await runProcess("docker", [
     "run",
     "-d",
@@ -363,6 +381,7 @@ export async function startInstance(projectRoot, paths, instance) {
     instance.containerName,
     "--restart",
     "unless-stopped",
+    ...resourceArgs,
     "-p",
     `${instance.port}:18789`,
     "-e",
@@ -381,6 +400,13 @@ export async function startInstance(projectRoot, paths, instance) {
   if (result.code !== 0) {
     throw new Error(`启动实例失败:\n${result.stderr || result.stdout}`);
   }
+
+  logRuntime("info", `实例容器已启动：${instance.containerName}`, {
+    port: instance.port,
+    cpus: RUNNER_CPUS || null,
+    memory: RUNNER_MEMORY || null,
+    image: RUNNER_IMAGE,
+  });
 
   return inspectInstance(instance);
 }
