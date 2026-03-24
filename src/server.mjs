@@ -596,6 +596,50 @@ async function ensureInstanceRunning(instance) {
   return instance;
 }
 
+function pickDefaultModelPreset(database) {
+  const presets = Array.isArray(database?.modelPresets) ? database.modelPresets : [];
+  if (!presets.length) {
+    return null;
+  }
+
+  const exactOpenAIGpt54 = presets.find((preset) =>
+    preset?.providerId === "openai" &&
+    String(preset?.modelId || "").trim().toLowerCase() === "gpt-5.4",
+  );
+  if (exactOpenAIGpt54) {
+    return exactOpenAIGpt54;
+  }
+
+  return presets[0] || null;
+}
+
+function ensureInstanceDefaultModel(instance) {
+  if (instance?.model) {
+    return instance;
+  }
+
+  const database = loadDatabase(dataDir);
+  const defaultPreset = pickDefaultModelPreset(database);
+  if (!defaultPreset) {
+    return instance;
+  }
+
+  instance.model = sanitizeModelPayload(defaultPreset);
+  instance.updatedAt = nowIso();
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target || target.model) {
+      return;
+    }
+
+    target.model = instance.model;
+    target.updatedAt = instance.updatedAt;
+  });
+
+  return instance;
+}
+
 async function handleRegister(request, response) {
   let body;
   try {
@@ -908,9 +952,9 @@ async function handleCreateInstance(request, response) {
   }
 
   let model = null;
+  const database = loadDatabase(dataDir);
   if (body.presetId) {
-    const database0 = loadDatabase(dataDir);
-    const preset = (database0.modelPresets || []).find((p) => p.id === body.presetId);
+    const preset = (database.modelPresets || []).find((p) => p.id === body.presetId);
     if (!preset) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
@@ -923,9 +967,12 @@ async function handleCreateInstance(request, response) {
       sendJson(response, 400, { error: error.message });
       return;
     }
+  } else {
+    const defaultPreset = pickDefaultModelPreset(database);
+    if (defaultPreset) {
+      model = sanitizeModelPayload(defaultPreset);
+    }
   }
-
-  const database = loadDatabase(dataDir);
 
   const existingCount = database.instances.filter((record) => record.userId === user.id).length;
   if (existingCount >= 1) {
@@ -1285,7 +1332,7 @@ async function handleStartInstance(request, response, instanceId) {
     return;
   }
 
-  const instance = findOwnedInstance(user, instanceId);
+  const instance = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
   if (!instance) {
     sendJson(response, 404, { error: "实例不存在。" });
     return;
@@ -1399,7 +1446,7 @@ async function handleWechatBind(request, response, instanceId) {
     return;
   }
 
-  const instance = findOwnedInstance(user, instanceId);
+  const instance = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
   if (!instance) {
     sendJson(response, 404, { error: "实例不存在。" });
     return;
@@ -1423,6 +1470,8 @@ async function handleWechatBind(request, response, instanceId) {
     });
     return;
   }
+
+  writeInstanceFiles(dataDir, instance);
 
   patchWechatState(instance.id, {
     status: "starting",

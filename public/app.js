@@ -502,6 +502,10 @@ async function loadModelPresets() {
   if (!state.user) { state.modelPresets = []; return; }
   const payload = await requestJson("/api/model-presets", { method: "GET" });
   state.modelPresets = payload.presets || [];
+  if (!state.onboardData.presetId && state.modelPresets.length) {
+    state.onboardData.presetId = state.modelPresets[0].id;
+  }
+  render();
 }
 
 async function loadModelProviders() {

@@ -42,6 +42,9 @@ RUN mkdir -p "${OPENCLAW_PREINSTALLED_HOME}" \
     && OPENCLAW_HOME="${OPENCLAW_PREINSTALLED_HOME}" \
        OPENCLAW_CONFIG_PATH="${OPENCLAW_PREINSTALLED_HOME}/openclaw.json" \
        openclaw plugins install "${OPENCLAW_WECHAT_PLUGIN_SPEC}" \
+    && mkdir -p "${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}/node_modules" \
+    && ln -sfn /usr/local/lib/node_modules/openclaw \
+       "${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}/node_modules/openclaw" \
     && test -d "${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}"
 
 WORKDIR /workspace
