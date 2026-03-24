@@ -17,6 +17,11 @@ import {
   normalizeModelSelection,
   sanitizeModelSelectionPayload,
 } from "./model-providers.mjs";
+import {
+  isModelPresetConfigured,
+  normalizeModelPresetPayload,
+  resolveModelPresetForRuntime,
+} from "./model-presets.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 import {
   execInstanceShell,
@@ -613,6 +618,7 @@ function syncInstanceModelProviderConfig(instanceId) {
 }
 
 async function ensureInstanceRunning(instance) {
+  writeInstanceFiles(dataDir, instance);
   const runtimeState = await inspectInstance(instance);
   if (runtimeState.running) {
     return instance;
@@ -645,14 +651,6 @@ function pickDefaultModelPreset(database) {
   const markedDefault = presets.find((preset) => preset?.isDefault);
   if (markedDefault) {
     return markedDefault;
-  }
-
-  const exactOpenAIGpt54 = presets.find((preset) =>
-    preset?.providerId === "openai" &&
-    String(preset?.modelId || "").trim().toLowerCase() === "gpt-5.4",
-  );
-  if (exactOpenAIGpt54) {
-    return exactOpenAIGpt54;
   }
 
   return presets[0] || null;
@@ -1008,7 +1006,12 @@ async function handleCreateInstance(request, response) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    model = sanitizeModelPayload(preset);
+    try {
+      model = resolveModelPresetForRuntime(preset);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
   } else if (body.providerKey || body.providerId || body.modelId || body.apiKey) {
     try {
       model = sanitizeModelPayload(body);
@@ -1019,7 +1022,12 @@ async function handleCreateInstance(request, response) {
   } else {
     const defaultPreset = pickDefaultModelPreset(database);
     if (defaultPreset) {
-      model = sanitizeModelPayload(defaultPreset);
+      try {
+        model = resolveModelPresetForRuntime(defaultPreset);
+      } catch (error) {
+        sendJson(response, 400, { error: error.message });
+        return;
+      }
     }
   }
 
@@ -1095,7 +1103,12 @@ async function handleUpdateModel(request, response, instanceId) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    nextPrimary = sanitizeModelPayload(preset, instance.model);
+    try {
+      nextPrimary = resolveModelPresetForRuntime(preset, instance.model);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
   } else {
     try {
       nextPrimary = sanitizeModelPayload(body, instance.model);
@@ -1195,7 +1208,12 @@ async function handleAddInstanceModel(request, response, instanceId) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    nextModel = sanitizeModelPayload(preset);
+    try {
+      nextModel = resolveModelPresetForRuntime(preset);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
   } else {
     try {
       nextModel = sanitizeModelPayload(body);
@@ -1693,6 +1711,7 @@ async function handleRestartGateway(request, response, instanceId) {
     return;
   }
 
+  writeInstanceFiles(dataDir, instance);
   await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
   const latest = await refreshInstanceRuntimeState(instance.id);
 
@@ -1797,8 +1816,14 @@ function proxyRequest(request, response, instance, subPath, queryString) {
   const targetPath = `/${subPath}${queryString ? `?${queryString}` : ""}`;
 
   const headers = { ...request.headers };
-  delete headers.host;
   delete headers.cookie;
+  if (request.headers.host) {
+    headers.host = request.headers.host;
+    headers["x-forwarded-host"] = request.headers.host;
+  }
+  if (!headers["x-forwarded-proto"]) {
+    headers["x-forwarded-proto"] = request.socket.encrypted ? "https" : "http";
+  }
   headers.authorization = `Bearer ${instance.gatewayToken}`;
 
   const proxyReq = http.request(
@@ -2148,6 +2173,7 @@ const server = http.createServer(async (request, response) => {
         id: p.id,
         name: p.name,
         isDefault: Boolean(p.isDefault),
+        isConfigured: isModelPresetConfigured(p),
         providerKey: p.providerKey,
         providerId: p.providerId,
         modelId: p.modelId,
@@ -2175,10 +2201,11 @@ const server = http.createServer(async (request, response) => {
       const name = sanitizeName(body.name);
       if (!name) { sendJson(response, 400, { error: "预设名称不能为空。" }); return; }
       let model;
-      try { model = sanitizeModelPayload(body); } catch (error) {
+      try { model = normalizeModelPresetPayload(body); } catch (error) {
         sendJson(response, 400, { error: error.message });
         return;
       }
+      const database = loadDatabase(dataDir);
       const existingPresets = Array.isArray(database.modelPresets) ? database.modelPresets : [];
       const preset = {
         id: `preset_${Date.now().toString(36)}`,
@@ -2238,7 +2265,7 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       let model;
-      try { model = sanitizeModelPayload(body, existingPreset); } catch (error) {
+      try { model = normalizeModelPresetPayload(body, existingPreset); } catch (error) {
         sendJson(response, 400, { error: error.message });
         return;
       }
@@ -2345,7 +2372,11 @@ server.on("upgrade", (request, socket, head) => {
     const target = net.connect(instance.port, "127.0.0.1", () => {
       const headers = { ...request.headers };
       delete headers.cookie;
-      headers.host = `127.0.0.1:${instance.port}`;
+      headers.host = request.headers.host || `127.0.0.1:${instance.port}`;
+      headers["x-forwarded-host"] = request.headers.host || headers.host;
+      if (!headers["x-forwarded-proto"]) {
+        headers["x-forwarded-proto"] = request.socket.encrypted ? "https" : "http";
+      }
       headers.authorization = `Bearer ${instance.gatewayToken}`;
 
       let rawHeader = `${request.method} ${targetPath} HTTP/1.1\r\n`;

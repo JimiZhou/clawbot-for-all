@@ -5,6 +5,7 @@ import { ensureDir, nowIso, slugify, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export const INSTANCE_BASE_PORT = 19000;
+export const OPENCLAW_CONTROL_UI_ROOT = "/usr/local/lib/node_modules/openclaw/dist/control-ui";
 
 export function getInstancePaths(dataDir, instanceId) {
   const baseDir = path.join(dataDir, "instances", instanceId);
@@ -123,6 +124,10 @@ export function buildOpenClawConfig(instance) {
       },
       controlUi: {
         enabled: true,
+        root: OPENCLAW_CONTROL_UI_ROOT,
+        allowInsecureAuth: true,
+        dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
       },
     },
   };

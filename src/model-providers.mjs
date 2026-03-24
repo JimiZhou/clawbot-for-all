@@ -685,7 +685,7 @@ export function normalizeModelChain(models, fallbackModel = null) {
   });
 }
 
-export function sanitizeModelSelectionPayload(payload = {}, existingModel = null) {
+export function sanitizeModelSelectionPayload(payload = {}, existingModel = null, options = {}) {
   const normalizedExisting = normalizeModelSelection(existingModel);
   const requestedKey = trimString(payload.providerKey) || normalizedExisting?.providerKey || guessProviderKeyFromLegacyModel(payload);
   const definition = getModelProviderDefinition(requestedKey) || getModelProviderDefinition("custom-provider");
@@ -695,7 +695,7 @@ export function sanitizeModelSelectionPayload(payload = {}, existingModel = null
     throw new Error("模型配置不完整，请至少填写 provider、model 和 API 模式。");
   }
 
-  if (definition.authType === "api_key" && !next.apiKey) {
+  if (definition.authType === "api_key" && !options.allowMissingApiKey && !next.apiKey) {
     throw new Error("当前模型需要 API Key。");
   }
 

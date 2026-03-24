@@ -232,6 +232,30 @@ function showToast(message, tone = "error") {
   setTimeout(close, 5000);
 }
 
+function syncUserMenuDom() {
+  const trigger = document.querySelector(".user-dropdown-trigger");
+  const menu = document.getElementById("user-menu");
+  if (!trigger || !menu) return false;
+
+  const expanded = state.userMenuOpen ? "true" : "false";
+  trigger.setAttribute("aria-expanded", expanded);
+  menu.classList.toggle("open", state.userMenuOpen);
+  menu.setAttribute("aria-hidden", state.userMenuOpen ? "false" : "true");
+  return true;
+}
+
+function setUserMenuOpen(nextOpen, { renderIfMissing = false } = {}) {
+  const normalized = Boolean(nextOpen);
+  if (state.userMenuOpen === normalized && syncUserMenuDom()) {
+    return;
+  }
+
+  state.userMenuOpen = normalized;
+  if (!syncUserMenuDom() && renderIfMissing) {
+    render();
+  }
+}
+
 function modelProviderByKey(key) {
   return (state.modelProviders || []).find((provider) => provider.key === key) || null;
 }
@@ -714,7 +738,7 @@ async function bootstrap() {
         await Promise.all([loadAdminInstances(), loadAdminUsers(), loadInvites(), loadModelPresets(), loadAdminRunnerImage(), loadAdminServerLogs()]);
       }
     } else {
-      await loadInstances();
+      await Promise.all([loadInstances(), loadModelPresets()]);
     }
   }
   const hash = currentRoute();
@@ -824,7 +848,7 @@ function userDropdown() {
       <span class="user-name">${escapeHtml(state.user?.name || "")}</span>
       <span class="user-dropdown-arrow">&#9662;</span>
     </button>
-    <div class="user-dropdown-menu ${isOpen ? "open" : ""}" id="user-menu" role="menu">
+    <div class="user-dropdown-menu ${isOpen ? "open" : ""}" id="user-menu" role="menu" aria-hidden="${isOpen ? "false" : "true"}">
       <a class="user-dropdown-item" href="#/change-password">修改密码</a>
       <button class="user-dropdown-item" type="button" data-action="logout">退出登录</button>
     </div>
@@ -1503,6 +1527,23 @@ function bindingContent(inst, binding, pairedAccounts) {
   const hasGeneratedBefore = Boolean(binding.qrPayload || qrLink || visibleLog || binding.status === "error" || binding.status === "connected");
   const primaryLabel = hasGeneratedBefore ? "重新生成二维码" : "生成配对二维码";
 
+  if (binding.status === "connected") {
+    return `
+      <p class="text-muted" style="margin-bottom:12px">微信已绑定成功，二维码区域已隐藏。</p>
+      ${pairedAccounts.length
+        ? `
+          <h4 class="sub-title">已配对账号 (${pairedAccounts.length})</h4>
+          <div class="paired-list">${pairedAccounts.map((a) => `
+            <div class="paired-item">
+              <strong>${escapeHtml(a.accountId)}</strong>
+              <span>${escapeHtml(a.userId || "—")}</span>
+              <span>${formatDateTime(a.savedAt)}</span>
+            </div>`).join("")}</div>
+        `
+        : `<p class="empty-text">已完成连接，但当前还没有读取到可展示的配对账号信息。</p>`
+      }`;
+  }
+
   if (binding.status === "starting") {
     return `
       <div class="starting-animation">
@@ -1518,8 +1559,8 @@ function bindingContent(inst, binding, pairedAccounts) {
       ${qrLink ? `<a class="btn btn-ghost btn-sm" href="${qrLink}" target="_blank" rel="noreferrer">打开微信扫码页</a>` : ""}
     </div>
     ${qrMarkup(binding, qrImageSrc, qrLink)}
-    ${visibleLog && binding.status !== "connected" ? `<pre class="log-output small-log">${escapeHtml(visibleLog)}</pre>` : ""}
-    ${pairedAccounts.length ? `
+      ${visibleLog && binding.status !== "connected" ? `<pre class="log-output small-log">${escapeHtml(visibleLog)}</pre>` : ""}
+      ${pairedAccounts.length ? `
       <h4 class="sub-title">已配对账号 (${pairedAccounts.length})</h4>
       <div class="paired-list">${pairedAccounts.map((a) => `
         <div class="paired-item">
@@ -1550,6 +1591,30 @@ function renderModelChain(inst) {
           </div>
         </div>
       `).join("")}
+    </div>`;
+}
+
+function renderPresetPicker(inst, presets) {
+  if (!presets.length) {
+    return `<p class="empty-text">管理员还没有配置可用模型预设，请先在管理员后台创建默认预设后再来选择。</p>`;
+  }
+
+  const defaultPresetId = presets.find((item) => item.isDefault)?.id || presets[0]?.id || "";
+  return `
+    <div class="preset-picker" data-instance-id="${inst.id}">
+      <label class="form-label">管理员预设模型
+        <select class="form-input" data-action="select-instance-preset">
+          ${presets.map((preset) => `
+            <option value="${escapeHtml(preset.id)}" ${preset.id === defaultPresetId ? "selected" : ""}>
+              ${escapeHtml(preset.name)}${preset.isDefault ? " · 默认" : ""}${preset.isConfigured === false ? " · 未配置" : ""} · ${escapeHtml(preset.providerId)}/${escapeHtml(preset.modelId)}
+            </option>
+          `).join("")}
+        </select>
+      </label>
+      <div class="form-actions" style="justify-content:flex-start">
+        <button class="btn btn-secondary btn-sm" type="button" data-action="apply-selected-preset" data-instance-id="${inst.id}">设为默认模型</button>
+        <button class="btn btn-ghost btn-sm" type="button" data-action="add-selected-preset-fallback" data-instance-id="${inst.id}">添加为 fallback</button>
+      </div>
     </div>`;
 }
 
@@ -1586,22 +1651,9 @@ function instanceConfigTab(inst) {
       <p class="text-muted" style="margin-bottom:12px">创建实例时只会写入 1 个默认模型。后续你可以继续添加模型，并指定默认模型与 fallback 顺序。</p>
       ${renderModelChain(inst)}
 
-      ${presets.length ? `
-        <div class="config-section-label">从预设添加模型</div>
-        <div class="preset-list compact">
-          ${presets.map((p) => `
-            <div class="preset-card-btn">
-              <strong>${escapeHtml(p.name)}</strong>
-              <span class="text-muted">${escapeHtml(p.providerId)}/${escapeHtml(p.modelId)}</span>
-              <div class="model-chain-actions">
-                <button class="btn btn-secondary btn-sm" data-action="apply-preset" data-preset-id="${p.id}" data-instance-id="${inst.id}">设为默认</button>
-                <button class="btn btn-ghost btn-sm" data-action="add-preset-fallback" data-preset-id="${p.id}" data-instance-id="${inst.id}">添加为 fallback</button>
-              </div>
-            </div>
-          `).join("")}
-        </div>
-        <div class="config-section-label">或手动添加模型</div>
-      ` : ""}
+      <div class="config-section-label">选择管理员预设模型</div>
+      ${renderPresetPicker(inst, presets)}
+      <div class="config-section-label">或手动添加模型</div>
 
       ${providerOptions.length ? `
         <form class="form-stack" data-form="update-model" data-instance-id="${inst.id}">
@@ -1882,6 +1934,10 @@ document.addEventListener("change", (event) => {
     return;
   }
 
+  if (target.getAttribute("data-action") === "select-instance-preset" && target instanceof HTMLSelectElement) {
+    return;
+  }
+
   const form = target.closest('form[data-form="update-model"]');
   if (form instanceof HTMLFormElement) {
     syncModelDraftFromForm(form);
@@ -1917,9 +1973,7 @@ document.addEventListener("click", async (event) => {
 
   // Close user dropdown when clicking outside
   if (state.userMenuOpen && !target.closest(".user-dropdown")) {
-    state.userMenuOpen = false;
-    document.getElementById("user-menu")?.classList.remove("open");
-    document.querySelector(".user-dropdown-trigger")?.setAttribute("aria-expanded", "false");
+    setUserMenuOpen(false);
   }
 
   const actionEl = target.closest("[data-action]");
@@ -1936,8 +1990,7 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "toggle-user-menu") {
-      state.userMenuOpen = !state.userMenuOpen;
-      render();
+      setUserMenuOpen(!state.userMenuOpen, { renderIfMissing: true });
       return;
     }
 
@@ -1969,6 +2022,25 @@ document.addEventListener("click", async (event) => {
       return;
     }
 
+    if (action === "apply-selected-preset") {
+      const iid = actionEl.getAttribute("data-instance-id");
+      const picker = actionEl.closest(".preset-picker");
+      const presetId = picker?.querySelector('select[data-action="select-instance-preset"]')?.value || "";
+      if (!presetId) {
+        throw new Error("请先选择一个管理员预设模型。");
+      }
+      setBusy(`model:${iid}`);
+      await requestJson(`/api/instances/${iid}/model`, {
+        method: "PUT",
+        body: JSON.stringify({ presetId }),
+      });
+      await loadInstances();
+      const latest = state.instances.find((item) => item.id === iid);
+      state.modelDrafts[iid] = createModelDraft(latest?.model || null);
+      setFlash("已应用管理员预设模型。");
+      return;
+    }
+
     if (action === "add-preset-fallback") {
       const presetId = actionEl.getAttribute("data-preset-id");
       const iid = actionEl.getAttribute("data-instance-id");
@@ -1979,6 +2051,23 @@ document.addEventListener("click", async (event) => {
       });
       await loadInstances();
       setFlash("已添加 fallback 模型。");
+      return;
+    }
+
+    if (action === "add-selected-preset-fallback") {
+      const iid = actionEl.getAttribute("data-instance-id");
+      const picker = actionEl.closest(".preset-picker");
+      const presetId = picker?.querySelector('select[data-action="select-instance-preset"]')?.value || "";
+      if (!presetId) {
+        throw new Error("请先选择一个管理员预设模型。");
+      }
+      setBusy(`model-add:${iid}`);
+      await requestJson(`/api/instances/${iid}/models`, {
+        method: "POST",
+        body: JSON.stringify({ presetId }),
+      });
+      await loadInstances();
+      setFlash("已把管理员预设添加为 fallback。");
       return;
     }
 
@@ -2305,9 +2394,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
 
   if (state.userMenuOpen) {
-    state.userMenuOpen = false;
-    document.getElementById("user-menu")?.classList.remove("open");
-    document.querySelector(".user-dropdown-trigger")?.setAttribute("aria-expanded", "false");
+    setUserMenuOpen(false);
   }
 
   const toast = document.querySelector(".toast-overlay");

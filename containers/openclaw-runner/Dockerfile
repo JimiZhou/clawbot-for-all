@@ -24,7 +24,14 @@ RUN mkdir -p "${OPENCLAW_PREINSTALLED_HOME}" \
        '{' \
        '  "gateway": {' \
        '    "bind": "lan",' \
-       '    "port": 18789' \
+       '    "port": 18789,' \
+       '    "controlUi": {' \
+       '      "enabled": true,' \
+       '      "root": "/usr/local/lib/node_modules/openclaw/dist/control-ui",' \
+       '      "allowInsecureAuth": true,' \
+       '      "dangerouslyDisableDeviceAuth": true,' \
+       '      "dangerouslyAllowHostHeaderOriginFallback": true' \
+       '    }' \
        '  },' \
        '  "agents": {' \
        '    "defaults": {' \

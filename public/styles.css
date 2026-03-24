@@ -291,6 +291,7 @@ img {
   position: sticky;
   top: 0;
   z-index: 60;
+  overflow: visible;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -430,7 +431,7 @@ img {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  display: none;
+  display: grid;
   z-index: 80;
   min-width: 168px;
   padding: 8px;
@@ -438,10 +439,25 @@ img {
   border-radius: var(--radius-md);
   background: color-mix(in oklab, white 92%, var(--card));
   box-shadow: var(--shadow-md);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate3d(0, -4px, 0);
+  transition:
+    opacity 160ms var(--ease-out),
+    transform 180ms var(--ease-out),
+    visibility 0s linear 180ms;
 }
 
 .user-dropdown-menu.open {
-  display: grid;
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translate3d(0, 0, 0);
+  transition:
+    opacity 160ms var(--ease-out),
+    transform 180ms var(--ease-out),
+    visibility 0s linear 0s;
 }
 
 .user-dropdown-item {
@@ -972,6 +988,12 @@ img {
 
 .preset-list.compact {
   gap: 10px;
+}
+
+.preset-picker {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 8px;
 }
 
 .preset-card-btn {
