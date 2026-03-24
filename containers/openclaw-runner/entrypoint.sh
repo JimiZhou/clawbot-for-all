@@ -27,6 +27,9 @@ if [ ! -f "${OPENCLAW_CONFIG_PATH}" ]; then
     }
   },
   "plugins": {
+    "allow": [
+      "openclaw-weixin"
+    ],
     "entries": {
       "openclaw-weixin": {
         "enabled": true

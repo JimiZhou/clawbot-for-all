@@ -30,13 +30,6 @@ RUN mkdir -p "${OPENCLAW_PREINSTALLED_HOME}" \
        '    "defaults": {' \
        '      "workspace": "/workspace"' \
        '    }' \
-       '  },' \
-       '  "plugins": {' \
-       '    "entries": {' \
-       '      "openclaw-weixin": {' \
-       '        "enabled": true' \
-       '      }' \
-       '    }' \
        '  }' \
        '}' \
        > "${OPENCLAW_PREINSTALLED_HOME}/openclaw.json" \

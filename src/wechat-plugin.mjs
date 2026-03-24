@@ -3,6 +3,9 @@ export const WECHAT_CHANNEL_ID = "openclaw-weixin";
 
 export function withWechatPluginEnabled(plugins = {}) {
   const allow = Array.isArray(plugins?.allow) ? [...plugins.allow] : [];
+  if (!allow.includes(WECHAT_CHANNEL_ID)) {
+    allow.push(WECHAT_CHANNEL_ID);
+  }
   const sourceEntries =
     plugins?.entries && typeof plugins.entries === "object" && !Array.isArray(plugins.entries)
       ? plugins.entries
