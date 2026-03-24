@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   nowIso,
+  shellEscape,
 } from "./utils.mjs";
 import { WECHAT_CHANNEL_ID, WECHAT_PLUGIN_SPEC } from "./wechat-plugin.mjs";
 
@@ -483,12 +484,22 @@ export async function getInstanceLogs(instance, tail = 200) {
 
 function extractAsciiQr(output) {
   const lines = output.split(/\r?\n/);
-  const qrLines = lines.filter((line) => /[█▀▄▌▐▓▒]/.test(line));
-  if (qrLines.length < 4) {
-    return "";
-  }
+  const isQrLine = (line) => /[█▀▄▌▐▓▒░#]/.test(line) && line.trim().length >= 10;
 
-  return qrLines.join("\n");
+  let bestRun = [];
+  let currentRun = [];
+  for (const line of lines) {
+    if (isQrLine(line)) {
+      currentRun.push(line);
+    } else {
+      if (currentRun.length > bestRun.length) bestRun = currentRun;
+      currentRun = [];
+    }
+  }
+  if (currentRun.length > bestRun.length) bestRun = currentRun;
+
+  if (bestRun.length < 4) return "";
+  return bestRun.join("\n");
 }
 
 function buildWechatCommand() {
@@ -620,4 +631,105 @@ export function startWechatBindJob(instance, handlers = {}) {
   });
 
   return child;
+}
+
+function buildInteractiveDockerExecArgs(instance, command) {
+  return ["exec", "-i", instance.containerName, "/bin/sh", "-lc", command];
+}
+
+function buildScriptInvocation(command, args) {
+  if (process.platform === "darwin") {
+    return {
+      command: "script",
+      args: ["-q", "/dev/null", command, ...args],
+    };
+  }
+
+  const fullCommand = [command, ...args].map((part) => shellEscape(part)).join(" ");
+  return {
+    command: "script",
+    args: ["-qec", fullCommand, "/dev/null"],
+  };
+}
+
+export function startInteractiveInstanceCommand(instance, command, options = {}, handlers = {}) {
+  const dockerArgs = buildInteractiveDockerExecArgs(instance, command);
+  const scriptInvocation = buildScriptInvocation("docker", dockerArgs);
+  const child = spawn(scriptInvocation.command, scriptInvocation.args, {
+    env: {
+      ...process.env,
+      ...(options.env || {}),
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let combinedOutput = "";
+  let timedOut = false;
+  const timeoutMs = Number(options.timeoutMs || 15 * 60 * 1000);
+  const timeoutId = timeoutMs > 0
+    ? setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGTERM");
+      }, timeoutMs)
+    : null;
+
+  const emitUpdate = () => {
+    handlers.onUpdate?.({
+      output: combinedOutput,
+      updatedAt: nowIso(),
+    });
+  };
+
+  child.stdout.on("data", (chunk) => {
+    combinedOutput += chunk.toString("utf8");
+    emitUpdate();
+  });
+
+  child.stderr.on("data", (chunk) => {
+    combinedOutput += chunk.toString("utf8");
+    emitUpdate();
+  });
+
+  child.on("close", (code, signal) => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+
+    handlers.onExit?.({
+      code,
+      signal,
+      timedOut,
+      output: combinedOutput,
+      updatedAt: nowIso(),
+    });
+  });
+
+  child.on("error", (error) => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+
+    handlers.onExit?.({
+      code: 1,
+      signal: null,
+      timedOut: false,
+      output: combinedOutput ? `${combinedOutput}\n${error.message || error}` : String(error.message || error),
+      updatedAt: nowIso(),
+    });
+  });
+
+  return {
+    child,
+    cancel() {
+      child.kill("SIGTERM");
+    },
+  };
+}
+
+export function sendInteractiveInput(job, text) {
+  if (!job?.child?.stdin || job.child.stdin.destroyed) {
+    throw new Error("当前交互式会话不可写入。");
+  }
+
+  job.child.stdin.write(text);
 }

@@ -1,4 +1,5 @@
 import path from "node:path";
+import { normalizeModelSelection } from "./model-providers.mjs";
 import { ensureDir, nowIso, randomId, readJsonFile, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
@@ -28,6 +29,7 @@ function normalizeUser(user) {
 function normalizeInstance(instance) {
   return {
     ...instance,
+    model: normalizeModelSelection(instance.model),
     provisioning: instance.provisioning || {
       status: "ready",
       percent: 100,
@@ -36,6 +38,15 @@ function normalizeInstance(instance) {
       updatedAt: instance.updatedAt || instance.createdAt || nowIso(),
     },
     plugins: withWechatPluginEnabled(instance.plugins),
+    modelAuth: instance.modelAuth || {
+      status: "idle",
+      updatedAt: null,
+      message: "",
+      outputSnippet: "",
+      authUrl: "",
+      promptLabel: "",
+      needsInput: false,
+    },
     wechatBinding: instance.wechatBinding || {
       status: "idle",
       updatedAt: null,
@@ -56,6 +67,18 @@ function normalizeInvite(invite) {
   };
 }
 
+function normalizeModelPreset(preset) {
+  if (!preset || typeof preset !== "object") {
+    return preset;
+  }
+
+  const normalizedModel = normalizeModelSelection(preset);
+  return {
+    ...preset,
+    ...(normalizedModel || {}),
+  };
+}
+
 export function normalizeDatabase(database) {
   const normalized = {
     ...createEmptyDatabase(),
@@ -68,7 +91,9 @@ export function normalizeDatabase(database) {
     ? normalized.instances.map(normalizeInstance)
     : [];
   normalized.invites = Array.isArray(normalized.invites) ? normalized.invites.map(normalizeInvite) : [];
-  normalized.modelPresets = Array.isArray(normalized.modelPresets) ? normalized.modelPresets : [];
+  normalized.modelPresets = Array.isArray(normalized.modelPresets)
+    ? normalized.modelPresets.map(normalizeModelPreset)
+    : [];
   normalized.version = 2;
   return normalized;
 }

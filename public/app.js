@@ -44,6 +44,13 @@ const state = {
   onboardData: {},
   registerData: {},
   modelPresets: [],
+  modelProviders: [],
+  modelDrafts: {},
+  adminPresetDraft: null,
+  adminPresetFilters: {
+    providerKey: "",
+    authType: "",
+  },
   instanceTab: "run",
 };
 
@@ -162,6 +169,223 @@ function showToast(message, tone = "error") {
   setTimeout(close, 5000);
 }
 
+function modelProviderByKey(key) {
+  return (state.modelProviders || []).find((provider) => provider.key === key) || null;
+}
+
+function defaultProviderKey() {
+  return state.modelProviders[0]?.key || "custom-provider";
+}
+
+function createModelDraft(model = null) {
+  const provider = modelProviderByKey(model?.providerKey) || modelProviderByKey(defaultProviderKey());
+  return {
+    providerKey: provider?.key || "custom-provider",
+    providerId: model?.providerId || provider?.providerId || "",
+    modelId: model?.modelId || provider?.defaultModelId || "",
+    apiMode: model?.apiMode || provider?.apiMode || "openai-responses",
+    baseUrl: model?.baseUrl || "",
+    apiKey: "",
+  };
+}
+
+function getModelDraft(instance) {
+  if (!state.modelDrafts[instance.id]) {
+    state.modelDrafts[instance.id] = createModelDraft(instance.model);
+  }
+
+  return state.modelDrafts[instance.id];
+}
+
+function getAdminPresetDraft() {
+  if (!state.adminPresetDraft) {
+    state.adminPresetDraft = {
+      name: "",
+      editingPresetId: "",
+      ...createModelDraft(null),
+    };
+  }
+
+  return state.adminPresetDraft;
+}
+
+function resetAdminPresetDraft() {
+  state.adminPresetDraft = {
+    name: "",
+    editingPresetId: "",
+    ...createModelDraft(null),
+  };
+}
+
+function switchModelDraftProvider(instanceId, providerKey) {
+  const provider = modelProviderByKey(providerKey);
+  const current = state.modelDrafts[instanceId] || {};
+  state.modelDrafts[instanceId] = {
+    providerKey: provider?.key || "custom-provider",
+    providerId: provider?.providerId || current.providerId || "",
+    modelId: provider?.defaultModelId || current.modelId || "",
+    apiMode: provider?.apiMode || current.apiMode || "openai-responses",
+    baseUrl: provider?.defaultBaseUrl || "",
+    apiKey: "",
+  };
+}
+
+function switchAdminPresetProvider(providerKey) {
+  const provider = modelProviderByKey(providerKey);
+  const current = getAdminPresetDraft();
+  state.adminPresetDraft = {
+    ...current,
+    providerKey: provider?.key || "custom-provider",
+    providerId: provider?.providerId || current.providerId || "",
+    modelId: provider?.defaultModelId || current.modelId || "",
+    apiMode: provider?.apiMode || current.apiMode || "openai-responses",
+    baseUrl: provider?.defaultBaseUrl || "",
+    apiKey: "",
+  };
+}
+
+function syncModelDraftFromForm(form) {
+  const instanceId = form.dataset.instanceId;
+  if (!instanceId) return;
+  const data = Object.fromEntries(new FormData(form).entries());
+  state.modelDrafts[instanceId] = {
+    ...(state.modelDrafts[instanceId] || {}),
+    ...data,
+  };
+}
+
+function syncAdminPresetDraftFromForm(form) {
+  const data = Object.fromEntries(new FormData(form).entries());
+  state.adminPresetDraft = {
+    ...(state.adminPresetDraft || getAdminPresetDraft()),
+    ...data,
+  };
+}
+
+function loadAdminPresetIntoDraft(preset) {
+  state.adminPresetDraft = {
+    name: preset.name || "",
+    editingPresetId: preset.id || "",
+    providerKey: preset.providerKey || defaultProviderKey(),
+    providerId: preset.providerId || "",
+    modelId: preset.modelId || "",
+    apiMode: preset.apiMode || "openai-responses",
+    baseUrl: preset.baseUrl || "",
+    apiKey: "",
+  };
+}
+
+function visibleModelPresets() {
+  const filters = state.adminPresetFilters || {};
+  const presets = state.modelPresets || [];
+  return presets.filter((preset) => {
+    if (filters.providerKey && preset.providerKey !== filters.providerKey) {
+      return false;
+    }
+
+    if (filters.authType && preset.authType !== filters.authType) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function chunkList(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+}
+
+function renderModelField(field, draft, currentModel) {
+  const value = draft[field.name] ?? "";
+  const placeholder = field.type === "password" && field.name === "apiKey" && currentModel?.apiKeyMasked
+    ? `留空保持当前 ${currentModel.apiKeyMasked}`
+    : (field.placeholder || "");
+
+  if (field.type === "select") {
+    return `<label class="form-label">${escapeHtml(field.label)}
+      <select class="form-input" name="${escapeHtml(field.name)}" ${field.required ? "required" : ""}>
+        ${(field.options || []).map((option) => `<option value="${escapeHtml(option.value)}" ${String(value) === option.value ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}
+      </select>
+    </label>`;
+  }
+
+  return `<label class="form-label">${escapeHtml(field.label)}
+    <input class="form-input" name="${escapeHtml(field.name)}" ${field.type === "password" ? 'type="password"' : ""} ${field.required ? "required" : ""} spellcheck="false" value="${field.type === "password" ? "" : escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" />
+  </label>`;
+}
+
+function modelDraftChanged(inst, draft) {
+  const saved = inst.model || {};
+  return [
+    "providerKey",
+    "providerId",
+    "modelId",
+    "apiMode",
+    "baseUrl",
+  ].some((key) => String(saved[key] || "") !== String(draft[key] || ""));
+}
+
+function renderModelAuthPanel(inst, draft) {
+  const savedModel = inst.model;
+  if (!savedModel) return "";
+  const provider = modelProviderByKey(savedModel.providerKey);
+  if (!provider?.supportsInteractiveAuth) return "";
+
+  const auth = inst.modelAuth || {};
+  const busyStart = state.busyKey === `model-auth-start:${inst.id}`;
+  const busyCancel = state.busyKey === `model-auth-cancel:${inst.id}`;
+  const busyInput = state.busyKey === `model-auth-input:${inst.id}`;
+  const draftDirty = modelDraftChanged(inst, draft);
+  const running = ["starting", "running", "waiting_input"].includes(auth.status);
+
+  return `
+    <div class="config-section-label">登录状态</div>
+    <div class="card" style="padding:16px">
+      <div class="card-header">
+        <h4 class="card-title">${escapeHtml(provider.label)}</h4>
+        ${statusBadge(auth.status || "idle", auth.status === "success" ? "success" : (auth.status === "error" ? "danger" : "accent"))}
+      </div>
+      ${auth.message ? `<p class="text-muted" style="margin-bottom:12px">${escapeHtml(auth.message)}</p>` : `<p class="text-muted" style="margin-bottom:12px">先保存模型选择，再启动供应商登录。</p>`}
+      ${draftDirty ? `<p class="text-muted" style="margin-bottom:12px">当前草稿尚未保存，保存后再开始登录。</p>` : ""}
+      <div class="form-actions" style="margin-bottom:12px">
+        <button class="btn btn-primary btn-sm" type="button" data-action="start-model-auth" data-instance-id="${inst.id}" ${draftDirty || running ? "disabled" : ""}>${busyStart ? "启动中..." : "开始登录"}</button>
+        ${running ? `<button class="btn btn-ghost btn-sm" type="button" data-action="cancel-model-auth" data-instance-id="${inst.id}">${busyCancel ? "取消中..." : "取消登录"}</button>` : ""}
+      </div>
+      ${auth.authUrl ? `<p style="margin-bottom:12px"><a href="${auth.authUrl}" target="_blank" rel="noreferrer">${escapeHtml(auth.authUrl)}</a></p>` : ""}
+      ${auth.needsInput ? `
+        <form class="form-stack" data-form="model-auth-input" data-instance-id="${inst.id}">
+          <label class="form-label">${escapeHtml(auth.promptLabel || "继续输入")}
+            <input class="form-input" name="text" required spellcheck="false" />
+          </label>
+          <button class="btn btn-secondary btn-sm" type="submit">${busyInput ? "提交中..." : "提交到 CLI"}</button>
+        </form>
+      ` : ""}
+      ${auth.outputSnippet ? `<pre class="log-output small-log">${escapeHtml(auth.outputSnippet)}</pre>` : ""}
+    </div>
+  `;
+}
+
+function authTypeLabel(authType) {
+  switch (authType) {
+    case "api_key":
+      return "API Key";
+    case "device_code":
+      return "Device Code";
+    case "oauth_redirect_paste":
+      return "OAuth 回填";
+    case "external_token_paste":
+      return "外部 Token 粘贴";
+    case "custom_gateway":
+      return "自定义";
+    default:
+      return authType || "未知";
+  }
+}
+
 /* ── Polling ──────────────────────────────────────────── */
 
 function updatePolling() {
@@ -181,7 +405,8 @@ function updatePolling() {
     state.instances.some(
       (i) =>
         i.provisioning?.status === "running" ||
-        ["starting", "waiting_scan", "scanned"].includes(i.wechatBinding?.status),
+        ["starting", "waiting_scan", "scanned"].includes(i.wechatBinding?.status) ||
+        ["starting", "running", "waiting_input"].includes(i.modelAuth?.status),
     );
 
   if (needsPolling) {
@@ -279,6 +504,16 @@ async function loadModelPresets() {
   state.modelPresets = payload.presets || [];
 }
 
+async function loadModelProviders() {
+  if (!state.user) {
+    state.modelProviders = [];
+    return;
+  }
+
+  const payload = await requestJson("/api/model-providers", { method: "GET" });
+  state.modelProviders = payload.providers || [];
+}
+
 /* ── Router ───────────────────────────────────────────── */
 
 function currentRoute() {
@@ -306,6 +541,7 @@ function autoNavigate() {
 async function bootstrap() {
   await loadSession();
   if (state.user && !state.user.mustChangePassword) {
+    await loadModelProviders();
     if (state.user.role === "admin") {
       const hash = currentRoute();
       if (hash === "#/admin" || hash.startsWith("#/admin")) {
@@ -336,18 +572,27 @@ async function bootstrap() {
 function asciiQrToSvgDataUrl(ascii) {
   const lines = ascii.split("\n").filter((l) => l.trim());
   if (!lines.length) return "";
-  const height = lines.length;
   const width = Math.max(...lines.map((l) => l.length));
+  const pixelH = lines.length * 2;
   let rects = "";
-  for (let y = 0; y < height; y++) {
+  for (let y = 0; y < lines.length; y++) {
     for (let x = 0; x < (lines[y]?.length || 0); x++) {
       const ch = lines[y][x];
-      if (ch === "\u2588" || ch === "#") {
-        rects += `<rect x="${x}" y="${y}" width="1" height="1"/>`;
+      const py = y * 2;
+      if (ch === "\u2588" || ch === "#" || ch === "\u2593") {
+        rects += `<rect x="${x}" y="${py}" width="1" height="2"/>`;
+      } else if (ch === "\u2580") {
+        rects += `<rect x="${x}" y="${py}" width="1" height="1"/>`;
+      } else if (ch === "\u2584") {
+        rects += `<rect x="${x}" y="${py + 1}" width="1" height="1"/>`;
+      } else if (ch === "\u258C") {
+        rects += `<rect x="${x}" y="${py}" width="0.5" height="2"/>`;
+      } else if (ch === "\u2590") {
+        rects += `<rect x="${x + 0.5}" y="${py}" width="0.5" height="2"/>`;
       }
     }
   }
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" shape-rendering="crispEdges"><rect width="${width}" height="${height}" fill="#fff"/><g fill="#000">${rects}</g></svg>`;
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${pixelH}" shape-rendering="crispEdges"><rect width="${width}" height="${pixelH}" fill="#fff"/><g fill="#000">${rects}</g></svg>`;
   return `data:image/svg+xml;base64,${btoa(svg)}`;
 }
 
@@ -400,10 +645,7 @@ function flashMarkup() {
 function navBar(items = [], right = "") {
   return `
     <nav class="navbar">
-      <button class="navbar-brand-group" type="button" data-action="nav-home">
-        <span class="navbar-brand-kicker">OpenClaw Launcher</span>
-        <span class="navbar-brand">Clawbot for All</span>
-      </button>
+      <div class="navbar-brand" data-action="nav-home">Clawbot for All</div>
       <div class="navbar-items">${items.map((i) => `<button class="navbar-item ${i.active ? "active" : ""}" data-action="${i.action}">${escapeHtml(i.label)}</button>`).join("")}</div>
       <div class="navbar-right">${right}</div>
     </nav>`;
@@ -422,15 +664,6 @@ function userDropdown() {
   </div>`;
 }
 
-function pageHero({ eyebrow = "", title = "", description = "" }) {
-  return `
-    <section class="page-hero">
-      ${eyebrow ? `<span class="page-hero-eyebrow">${escapeHtml(eyebrow)}</span>` : ""}
-      <h1 class="page-hero-title">${escapeHtml(title)}</h1>
-      ${description ? `<p class="page-hero-desc">${escapeHtml(description)}</p>` : ""}
-    </section>`;
-}
-
 /* ═══════════════════════════════════════════════════════
    VIEW: Login (#/login)
    ═══════════════════════════════════════════════════════ */
@@ -439,9 +672,7 @@ function loginView() {
   return `
     <div class="auth-layout">
       <div class="auth-card">
-        <span class="auth-eyebrow">多租户控制台</span>
         <h1 class="auth-title">登录 Clawbot for All</h1>
-        <p class="auth-sub">一个入口，统一管理实例启动、模型配置和微信绑定流程。</p>
         <form class="form-stack" data-form="login">
           <label class="form-label">邮箱<input class="form-input" required type="email" name="email" autocomplete="email" inputmode="email" placeholder="team@example.com" /></label>
           <label class="form-label">密码<input class="form-input" required type="password" name="password" autocomplete="current-password" placeholder="请输入密码" /></label>
@@ -467,9 +698,8 @@ function registerView() {
   return `
     <div class="auth-layout">
       <div class="auth-card">
-        <span class="auth-eyebrow">${hasInvite ? "邀请码注册" : "新用户注册"}</span>
         <h1 class="auth-title">${hasInvite ? "欢迎加入 Clawbot for All" : "注册新账号"}</h1>
-        ${hasInvite ? `<p class="auth-sub">你已收到邀请，填写以下信息即可完成注册并开始使用。</p>` : ""}
+        ${hasInvite ? `<p class="auth-sub">填写以下信息完成注册。</p>` : ""}
         <form class="form-stack" data-form="register">
           ${hasInvite
             ? `<input type="hidden" name="inviteCode" value="${escapeHtml(invitePrefill)}" />`
@@ -498,9 +728,7 @@ function settingsPasswordView() {
     <div class="page-body">
       <div class="onboard-layout">
         <div class="card">
-          <span class="section-kicker">账号安全</span>
           <h3 class="card-title">修改密码</h3>
-          <p class="section-note">更新后会立即作用到当前账号，建议使用包含大小写和数字的高强度密码。</p>
           <form class="form-stack" data-form="change-password">
             <label class="form-label">当前密码<input class="form-input" required name="currentPassword" type="password" autocomplete="current-password" /></label>
             <div class="form-row">
@@ -525,7 +753,6 @@ function changePasswordView() {
   return `
     <div class="auth-layout">
       <div class="auth-card">
-        <span class="auth-eyebrow">首次登录</span>
         <h1 class="auth-title">修改密码</h1>
         <p class="auth-sub">首次登录需要修改默认密码后才能继续。</p>
         <form class="form-stack" data-form="change-password">
@@ -561,11 +788,6 @@ function adminView() {
   return `
     ${navBar(tabs, userDropdown())}
     <div class="page-body">
-      ${pageHero({
-        eyebrow: "管理员视图",
-        title: "租户、邀请码与模型预设总览",
-        description: "集中处理多租户实例分发、运行状态和引导配置，减少重复维护成本。",
-      })}
       <div class="stats-row">
         <div class="stat-card"><div class="stat-value">${state.adminUsers.length}</div><div class="stat-label">用户数</div></div>
         <div class="stat-card"><div class="stat-value">${state.adminInstances.length}</div><div class="stat-label">实例数</div></div>
@@ -588,13 +810,6 @@ function adminInstancesTab() {
 
   return `
     <div class="card">
-      <div class="card-header">
-        <div>
-          <h3 class="card-title">实例总览</h3>
-          <p class="section-note">快速查看每个租户实例的运行状态、模型配置和微信绑定情况。</p>
-        </div>
-      </div>
-      <div class="table-wrap">
       <table class="table">
         <thead><tr>
           <th>实例名</th><th>所属用户</th><th>状态</th><th>端口</th><th>模型</th><th>CPU</th><th>内存</th><th>微信</th>
@@ -615,7 +830,6 @@ function adminInstancesTab() {
           }).join("")}
         </tbody>
       </table>
-      </div>
     </div>`;
 }
 
@@ -628,13 +842,8 @@ function adminImagesTab() {
   return `
     <div class="card">
       <div class="card-header">
-        <div>
-          <h3 class="card-title">Runner 镜像</h3>
-          <p class="section-note">Server 启动后会后台检查并预拉取 runner 镜像，不阻塞 HTTP 服务启动。这里展示当前配置镜像在 VPS 上的实际状态。</p>
-        </div>
-        <div class="form-actions">
-          <button class="btn btn-secondary btn-sm" type="button" data-action="refresh-runner-image">${state.busyKey === "runner-image-refresh" ? "刷新中..." : "重新拉取镜像"}</button>
-        </div>
+        <h3 class="card-title">Runner 镜像</h3>
+        <button class="btn btn-secondary btn-sm" type="button" data-action="refresh-runner-image">${state.busyKey === "runner-image-refresh" ? "刷新中..." : "重新拉取"}</button>
       </div>
 
       <div class="image-overview-grid">
@@ -682,23 +891,16 @@ function adminImagesTab() {
       ${image?.message ? `<div class="image-status-panel">${escapeHtml(image.message)}</div>` : ""}
       ${image?.lastError ? `<pre class="log-output small-log">${escapeHtml(image.lastError)}</pre>` : ""}
 
-      <div class="card-header image-metadata-header">
-        <div>
-          <h4 class="sub-title">镜像标签元数据</h4>
-          <p class="section-note">这里可以确认 GitHub 构建出的 runner 镜像是否带上了 OpenClaw 版本和源码修订信息。</p>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table class="table">
+      <h4 class="sub-title" style="margin-top:16px">标签元数据</h4>
+      <table class="table">
           <thead><tr><th>Label</th><th>Value</th></tr></thead>
           <tbody>
             ${Object.keys(labels).length
               ? Object.entries(labels).sort(([left], [right]) => left.localeCompare(right)).map(([key, value]) => `<tr><td><code>${escapeHtml(key)}</code></td><td><code>${escapeHtml(value)}</code></td></tr>`).join("")
-              : `<tr><td colspan="2"><span class="text-muted">当前镜像未提供额外标签元数据。</span></td></tr>`
+              : `<tr><td colspan="2"><span class="text-muted">无标签元数据</span></td></tr>`
             }
           </tbody>
         </table>
-      </div>
     </div>`;
 }
 
@@ -709,10 +911,7 @@ function adminServerLogsTab() {
   return `
     <div class="card">
       <div class="card-header">
-        <div>
-          <h3 class="card-title">Server 日志</h3>
-          <p class="section-note">这里展示应用服务本身的后台日志，包括启动、runner 镜像预热、实例创建异常和接口错误。日志会同时打印到 VPS 控制台并落盘到本地文件。</p>
-        </div>
+        <h3 class="card-title">服务日志</h3>
         <form class="log-controls" data-form="load-server-logs">
           <select class="form-input form-input-sm" name="tail">
             ${LOG_TAIL_OPTIONS.map((v) => `<option value="${v}" ${currentTail === v ? "selected" : ""}>最近 ${v} 行</option>`).join("")}
@@ -752,13 +951,6 @@ function adminUsersTab() {
 
   return `
     <div class="card">
-      <div class="card-header">
-        <div>
-          <h3 class="card-title">用户管理</h3>
-          <p class="section-note">删除用户会同步清理关联实例，危险操作仍保留二次确认。</p>
-        </div>
-      </div>
-      <div class="table-wrap">
       <table class="table">
         <thead><tr>
           <th>昵称</th><th>邮箱</th><th>角色</th><th>注册时间</th><th>实例状态</th><th>操作</th>
@@ -782,7 +974,6 @@ function adminUsersTab() {
           }).join("")}
         </tbody>
       </table>
-      </div>
     </div>`;
 }
 
@@ -792,9 +983,7 @@ function adminInvitesTab() {
 
   return `
     <div class="card">
-      <span class="section-kicker">邀请码分发</span>
       <h3 class="card-title">生成邀请码</h3>
-      <p class="section-note">支持一次性邀请码、限次邀请码和带到期时间的邀请码，适合灰度发放。</p>
       <form class="form-stack" data-form="create-invite">
         <div class="form-row">
           <label class="form-label">备注<input class="form-input" name="note" /></label>
@@ -811,7 +1000,7 @@ function adminInvitesTab() {
     <div class="card">
       <h3 class="card-title">可分发 (${activeInvites.length})</h3>
       ${activeInvites.length
-        ? `<div class="table-wrap"><table class="table"><thead><tr><th>Code</th><th>备注</th><th>使用/上限</th><th>到期时间</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${activeInvites.map((inv) => inviteRow(inv, true)).join("")}</tbody></table></div>`
+        ? `<table class="table"><thead><tr><th>Code</th><th>备注</th><th>使用/上限</th><th>到期时间</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${activeInvites.map((inv) => inviteRow(inv, true)).join("")}</tbody></table>`
         : `<p class="empty-text">暂无可分发的邀请码。</p>`
       }
     </div>
@@ -819,7 +1008,7 @@ function adminInvitesTab() {
     <div class="card">
       <h3 class="card-title">已归档 (${archivedInvites.length})</h3>
       ${archivedInvites.length
-        ? `<div class="table-wrap"><table class="table"><thead><tr><th>Code</th><th>备注</th><th>使用/上限</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${archivedInvites.map((inv) => inviteRow(inv, false)).join("")}</tbody></table></div>`
+        ? `<table class="table"><thead><tr><th>Code</th><th>备注</th><th>使用/上限</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>${archivedInvites.map((inv) => inviteRow(inv, false)).join("")}</tbody></table>`
         : `<p class="empty-text">暂无已归档的邀请码。</p>`
       }
     </div>`;
@@ -841,51 +1030,83 @@ function inviteRow(invite, actionable) {
 }
 
 function adminPresetsTab() {
-  const presets = state.modelPresets || [];
+  const presets = visibleModelPresets();
+  const allPresets = state.modelPresets || [];
+  const providerOptions = state.modelProviders || [];
+  const draft = getAdminPresetDraft();
+  const selectedProvider = modelProviderByKey(draft.providerKey);
+  const fieldRows = chunkList(selectedProvider?.fields || [], 2);
+  const editing = Boolean(draft.editingPresetId);
+  const groupedPresets = presets.reduce((acc, preset) => {
+    const key = preset.providerKey || "custom-provider";
+    if (!acc[key]) acc[key] = [];
+    acc[key].push(preset);
+    return acc;
+  }, {});
+  const authTypeOptions = [...new Set(allPresets.map((preset) => preset.authType).filter(Boolean))];
   return `
     <div class="card">
-      <span class="section-kicker">模型基线</span>
-      <h3 class="card-title">添加模型预设</h3>
-      <p class="section-note">预设会直接出现在新用户引导流程中，建议只保留已验证可用的组合。</p>
+      <h3 class="card-title">${editing ? "编辑模型预设" : "添加模型预设"}</h3>
+      ${providerOptions.length ? `
       <form class="form-stack" data-form="create-preset">
+        <input type="hidden" name="providerKey" value="${escapeHtml(draft.providerKey)}" />
+        <input type="hidden" name="editingPresetId" value="${escapeHtml(draft.editingPresetId || "")}" />
         <div class="form-row">
-          <label class="form-label">预设名称<input class="form-input" required name="name" /></label>
-          <label class="form-label">Provider ID<input class="form-input" required name="providerId" /></label>
-        </div>
-        <div class="form-row">
-          <label class="form-label">Model ID<input class="form-input" required name="modelId" /></label>
-          <label class="form-label">API Mode
-            <select class="form-input" name="apiMode">
-              ${MODEL_API_MODES.map((m) => `<option value="${m}">${m}</option>`).join("")}
+          <label class="form-label">预设名称<input class="form-input" required name="name" value="${escapeHtml(draft.name || "")}" /></label>
+          <label class="form-label">Provider 变体
+            <select class="form-input" name="providerKeySelect" data-action="change-preset-provider">
+              ${providerOptions.map((provider) => `<option value="${escapeHtml(provider.key)}" ${provider.key === draft.providerKey ? "selected" : ""}>${escapeHtml(provider.label)}</option>`).join("")}
             </select>
           </label>
         </div>
-        <div class="form-row">
-          <label class="form-label">Base URL<input class="form-input" name="baseUrl" /></label>
-          <label class="form-label">API Key<input class="form-input" required type="password" name="apiKey" /></label>
+        ${fieldRows.map((row) => `<div class="form-row">${row.map((field) => renderModelField(field, draft, null)).join("")}</div>`).join("")}
+        ${selectedProvider?.supportsInteractiveAuth ? `<p class="text-muted">该预设只保存模型选择。用户应用到实例后，仍需在实例配置页完成登录。</p>` : ""}
+        <div class="form-actions">
+          ${editing ? `<button class="btn btn-ghost" type="button" data-action="cancel-edit-preset">取消编辑</button>` : ""}
+          <button class="btn btn-primary" type="submit">${state.busyKey === "create-preset" ? (editing ? "保存中..." : "添加中...") : (editing ? "保存修改" : "添加预设")}</button>
         </div>
-        <button class="btn btn-primary" type="submit">${state.busyKey === "create-preset" ? "添加中..." : "添加预设"}</button>
       </form>
+      ` : `<p class="empty-text">正在加载可用 Provider 列表...</p>`}
     </div>
 
     <div class="card">
-      <h3 class="card-title">已有预设 (${presets.length})</h3>
-      ${presets.length ? `
-        <div class="table-wrap">
-        <table class="table">
-          <thead><tr><th>名称</th><th>Provider</th><th>Model</th><th>API Mode</th><th>操作</th></tr></thead>
-          <tbody>
-            ${presets.map((p) => `<tr>
-              <td><strong>${escapeHtml(p.name)}</strong></td>
-              <td>${escapeHtml(p.providerId)}</td>
-              <td>${escapeHtml(p.modelId)}</td>
-              <td>${escapeHtml(p.apiMode)}</td>
-              <td><button class="btn btn-danger btn-sm" data-action="delete-preset" data-preset-id="${p.id}">${state.busyKey === `delete-preset:${p.id}` ? "删除中..." : "删除"}</button></td>
-            </tr>`).join("")}
-          </tbody>
-        </table>
+      <div class="card-header">
+        <h3 class="card-title">已有预设 (${presets.length})</h3>
+        <div class="log-controls">
+          <label class="form-label" style="margin:0">Provider
+            <select class="form-input form-input-sm" data-action="filter-preset-provider">
+              <option value="">全部</option>
+              ${providerOptions.map((provider) => `<option value="${escapeHtml(provider.key)}" ${state.adminPresetFilters.providerKey === provider.key ? "selected" : ""}>${escapeHtml(provider.label)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="form-label" style="margin:0">认证
+            <select class="form-input form-input-sm" data-action="filter-preset-auth">
+              <option value="">全部</option>
+              ${authTypeOptions.map((authType) => `<option value="${escapeHtml(authType)}" ${state.adminPresetFilters.authType === authType ? "selected" : ""}>${escapeHtml(authTypeLabel(authType))}</option>`).join("")}
+            </select>
+          </label>
         </div>
-      ` : `<p class="empty-text">暂无模型预设。用户在注册后的引导流程中将看到这些预设。</p>`}
+      </div>
+      ${presets.length ? `
+        ${Object.entries(groupedPresets).map(([providerKey, entries]) => `
+          <h4 class="sub-title">${escapeHtml(modelProviderByKey(providerKey)?.label || providerKey)} (${entries.length})</h4>
+          <table class="table">
+            <thead><tr><th>名称</th><th>Model</th><th>认证方式</th><th>API Mode</th><th>操作</th></tr></thead>
+            <tbody>
+              ${entries.map((p) => `<tr>
+                <td><strong>${escapeHtml(p.name)}</strong></td>
+                <td>${escapeHtml(p.modelId)}</td>
+                <td>${escapeHtml(authTypeLabel(p.authType))}</td>
+                <td>${escapeHtml(p.apiMode)}</td>
+                <td>
+                  <button class="btn btn-ghost btn-sm" data-action="edit-preset" data-preset-id="${p.id}">编辑</button>
+                  <button class="btn btn-danger btn-sm" data-action="delete-preset" data-preset-id="${p.id}">${state.busyKey === `delete-preset:${p.id}` ? "删除中..." : "删除"}</button>
+                </td>
+              </tr>`).join("")}
+            </tbody>
+          </table>
+        `).join("")}
+      ` : `<p class="empty-text">暂无模型预设。</p>`}
     </div>`;
 }
 
@@ -900,9 +1121,7 @@ function onboardView() {
     <div class="page-body">
       <div class="onboard-layout">
         <div class="onboard-header">
-          <span class="section-kicker">快速引导</span>
           <h2>创建你的 OpenClaw 实例</h2>
-          <p class="section-note onboard-note">先命名，再选择默认模型。整个流程保持最小输入，方便快速开箱。</p>
           <div class="stepper">
             <span class="step ${step >= 1 ? "step-active" : ""}">1. 实例名称</span>
             <span class="step ${step >= 2 ? "step-active" : ""}">2. 选择模型</span>
@@ -936,7 +1155,7 @@ function onboardStep2() {
   const selectedPreset = state.onboardData.presetId || "";
   return `
     <h3>选择模型</h3>
-    <p class="section-note">选择管理员预配置的模型，或先创建实例，稍后在配置页补齐。</p>
+    <p class="text-muted" style="margin-bottom:16px">选择预配置模型，或跳过后自行配置。</p>
     ${presets.length ? `
       <div class="preset-list">
         ${presets.map((p) => `
@@ -944,7 +1163,7 @@ function onboardStep2() {
             <input type="radio" name="presetId" value="${escapeHtml(p.id)}" ${selectedPreset === p.id ? "checked" : ""} data-action="select-preset" />
             <div class="preset-card-body">
               <strong>${escapeHtml(p.name)}</strong>
-              <span class="text-muted">${escapeHtml(p.providerId)}/${escapeHtml(p.modelId)}</span>
+              <span class="text-muted">${escapeHtml(modelProviderByKey(p.providerKey)?.label || p.providerId)}/${escapeHtml(p.modelId)}</span>
             </div>
           </label>
         `).join("")}
@@ -1047,13 +1266,12 @@ function instanceRunTab(inst) {
   if (!running && !starting) {
     return `
       <div class="instance-hero">
-        <span class="section-kicker">运行面板</span>
         <div class="instance-hero-info">
           <h2>${escapeHtml(inst.name)}</h2>
           ${statusBadge(inst.status, instanceTone(inst))}
           ${inst.model ? `<span class="text-muted">${escapeHtml(inst.model.providerId)}/${escapeHtml(inst.model.modelId)}</span>` : `<span class="text-muted">未配置模型</span>`}
         </div>
-        <p class="instance-hero-desc">实例已经就绪。启动后即可拉起容器、进入监控，并开始微信扫码绑定。</p>
+        <p class="instance-hero-desc">实例已就绪，点击启动后即可绑定微信开始使用。</p>
         <button class="btn btn-primary btn-lg" data-action="start-instance" data-instance-id="${inst.id}">启动实例</button>
       </div>`;
   }
@@ -1061,7 +1279,6 @@ function instanceRunTab(inst) {
   if (starting) {
     return `
       <div class="instance-hero">
-        <span class="section-kicker">运行面板</span>
         <div class="instance-hero-info">
           <h2>${escapeHtml(inst.name)}</h2>
           ${statusBadge("starting", "accent")}
@@ -1082,7 +1299,7 @@ function instanceRunTab(inst) {
       <div class="instance-header-actions">
         <button class="btn btn-secondary btn-sm" data-action="stop-instance" data-instance-id="${inst.id}">${state.busyKey === `stop:${inst.id}` ? "停止中..." : "停止"}</button>
         <button class="btn btn-ghost btn-sm" data-action="restart-gateway" data-instance-id="${inst.id}">${state.busyKey === `gateway:${inst.id}` ? "重启中..." : "重启网关"}</button>
-        <a class="btn btn-ghost btn-sm" href="${inst.dashboardUrl}" target="_blank" rel="noreferrer">打开控制台</a>
+        <a class="btn btn-ghost btn-sm" href="${inst.dashboardUrl}" target="_blank" rel="noreferrer">Control UI</a>
       </div>
     </div>
 
@@ -1127,6 +1344,10 @@ function instanceConfigTab(inst) {
   const logs = state.logsByInstanceId[inst.id];
   const currentTail = state.logTailByInstanceId[inst.id] || 200;
   const presets = state.modelPresets || [];
+  const draft = getModelDraft(inst);
+  const selectedProvider = modelProviderByKey(draft.providerKey);
+  const providerOptions = state.modelProviders || [];
+  const fieldRows = chunkList(selectedProvider?.fields || [], 2);
 
   return `
     <div class="instance-header">
@@ -1141,9 +1362,8 @@ function instanceConfigTab(inst) {
     </div>
 
     <div class="card">
-      <span class="section-kicker">模型接入</span>
       <h3 class="card-title">模型配置</h3>
-      ${!inst.model ? `<p class="section-note">尚未配置模型，选择预设可快速落地，也可以直接填写自定义参数。</p>` : `<p class="section-note">修改后会立即写入实例配置。若只更新 Key，可保留其他字段不变。</p>`}
+      ${!inst.model ? `<p class="text-muted" style="margin-bottom:12px">尚未配置模型，选择预设或自行填写。</p>` : ""}
 
       ${presets.length ? `
         <div class="config-section-label">使用预设模型</div>
@@ -1158,33 +1378,25 @@ function instanceConfigTab(inst) {
         <div class="config-section-label">或自定义配置</div>
       ` : ""}
 
-      <form class="form-stack" data-form="update-model" data-instance-id="${inst.id}">
-        <div class="form-row">
-          <label class="form-label">Provider<input class="form-input" required name="providerId" value="${escapeHtml(inst.model?.providerId || "")}" /></label>
-          <label class="form-label">Model<input class="form-input" required name="modelId" value="${escapeHtml(inst.model?.modelId || "")}" /></label>
-        </div>
-        <div class="form-row">
-          <label class="form-label">API Mode
-            <select class="form-input" name="apiMode">
-              ${MODEL_API_MODES.map((m) => `<option value="${m}" ${(inst.model?.apiMode || "openai-responses") === m ? "selected" : ""}>${m}</option>`).join("")}
+      ${providerOptions.length ? `
+        <form class="form-stack" data-form="update-model" data-instance-id="${inst.id}">
+          <input type="hidden" name="providerKey" value="${escapeHtml(draft.providerKey)}" />
+          <label class="form-label">Provider 变体
+            <select class="form-input" name="providerKeySelect" data-action="change-model-provider" data-instance-id="${inst.id}">
+              ${providerOptions.map((provider) => `<option value="${escapeHtml(provider.key)}" ${provider.key === draft.providerKey ? "selected" : ""}>${escapeHtml(provider.label)}</option>`).join("")}
             </select>
           </label>
-          <label class="form-label">Base URL<input class="form-input" name="baseUrl" spellcheck="false" value="${escapeHtml(inst.model?.baseUrl || "")}" /></label>
-        </div>
-        <label class="form-label">API Key<input class="form-input" name="apiKey" type="password" ${inst.model ? `placeholder="留空保持当前 ${escapeHtml(inst.model.apiKeyMasked || "")}"` : ""} /></label>
-        <button class="btn btn-secondary btn-sm" type="submit">${state.busyKey === `model:${inst.id}` ? "保存中..." : "保存模型配置"}</button>
-      </form>
+          ${fieldRows.map((row) => `<div class="form-row">${row.map((field) => renderModelField(field, draft, inst.model)).join("")}</div>`).join("")}
+          <button class="btn btn-secondary btn-sm" type="submit">${state.busyKey === `model:${inst.id}` ? "保存中..." : "保存模型配置"}</button>
+        </form>
+        ${renderModelAuthPanel(inst, draft)}
+      ` : `<p class="empty-text">正在加载可用 Provider 列表...</p>`}
     </div>
 
     <details class="card collapsible">
-      <summary>
-        <div>
-          <span class="section-kicker">高级配置</span>
-          <span class="card-title">插件配置</span>
-        </div>
-      </summary>
+      <summary><h3 class="card-title">插件配置</h3></summary>
       <form class="form-stack" data-form="update-plugins" data-instance-id="${inst.id}">
-        <label class="form-label">插件 JSON<textarea class="form-input form-textarea" name="pluginsJson" spellcheck="false">${escapeHtml(JSON.stringify(inst.plugins || DEFAULT_PLUGIN_TEMPLATE, null, 2))}</textarea></label>
+        <label class="form-label">Plugins JSON<textarea class="form-input form-textarea" name="pluginsJson" spellcheck="false">${escapeHtml(JSON.stringify(inst.plugins || DEFAULT_PLUGIN_TEMPLATE, null, 2))}</textarea></label>
         <button class="btn btn-ghost btn-sm" type="submit">${state.busyKey === `plugins:${inst.id}` ? "保存中..." : "保存插件配置"}</button>
       </form>
     </details>
@@ -1319,11 +1531,17 @@ document.addEventListener("submit", async (event) => {
     }
 
     if (type === "create-preset") {
+      syncAdminPresetDraftFromForm(form);
       setBusy("create-preset");
-      await requestJson("/api/admin/model-presets", { method: "POST", body: JSON.stringify(data) });
+      const presetId = String(data.editingPresetId || "").trim();
+      await requestJson(presetId ? `/api/admin/model-presets/${presetId}` : "/api/admin/model-presets", {
+        method: presetId ? "PUT" : "POST",
+        body: JSON.stringify(data),
+      });
       await loadModelPresets();
-      form.reset();
-      setFlash("模型预设已添加。");
+      resetAdminPresetDraft();
+      setFlash(presetId ? "模型预设已更新。" : "模型预设已添加。");
+      render();
       return;
     }
 
@@ -1338,10 +1556,26 @@ document.addEventListener("submit", async (event) => {
 
     if (type === "update-model") {
       const instanceId = form.dataset.instanceId;
+      syncModelDraftFromForm(form);
       setBusy(`model:${instanceId}`);
       await requestJson(`/api/instances/${instanceId}/model`, { method: "PUT", body: JSON.stringify(data) });
       await loadInstances();
+      const latest = state.instances.find((item) => item.id === instanceId);
+      state.modelDrafts[instanceId] = createModelDraft(latest?.model || null);
       setFlash("模型配置已保存。");
+      return;
+    }
+
+    if (type === "model-auth-input") {
+      const instanceId = form.dataset.instanceId;
+      setBusy(`model-auth-input:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/model-auth/input`, {
+        method: "POST",
+        body: JSON.stringify({ text: data.text }),
+      });
+      await loadInstances();
+      form.reset();
+      setFlash("输入已提交。");
       return;
     }
 
@@ -1377,6 +1611,63 @@ document.addEventListener("submit", async (event) => {
     setFlash(error.message, "error");
   } finally {
     clearBusy();
+  }
+});
+
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+
+  if (target.getAttribute("data-action") === "change-model-provider" && target instanceof HTMLSelectElement) {
+    const instanceId = target.getAttribute("data-instance-id");
+    if (!instanceId) return;
+    switchModelDraftProvider(instanceId, target.value);
+    render();
+    return;
+  }
+
+  if (target.getAttribute("data-action") === "change-preset-provider" && target instanceof HTMLSelectElement) {
+    switchAdminPresetProvider(target.value);
+    render();
+    return;
+  }
+
+  if (target.getAttribute("data-action") === "filter-preset-provider" && target instanceof HTMLSelectElement) {
+    state.adminPresetFilters.providerKey = target.value || "";
+    render();
+    return;
+  }
+
+  if (target.getAttribute("data-action") === "filter-preset-auth" && target instanceof HTMLSelectElement) {
+    state.adminPresetFilters.authType = target.value || "";
+    render();
+    return;
+  }
+
+  const form = target.closest('form[data-form="update-model"]');
+  if (form instanceof HTMLFormElement) {
+    syncModelDraftFromForm(form);
+    return;
+  }
+
+  const presetForm = target.closest('form[data-form="create-preset"]');
+  if (presetForm instanceof HTMLFormElement) {
+    syncAdminPresetDraftFromForm(presetForm);
+  }
+});
+
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const form = target.closest('form[data-form="update-model"]');
+  if (form instanceof HTMLFormElement) {
+    syncModelDraftFromForm(form);
+    return;
+  }
+
+  const presetForm = target.closest('form[data-form="create-preset"]');
+  if (presetForm instanceof HTMLFormElement) {
+    syncAdminPresetDraftFromForm(presetForm);
   }
 });
 
@@ -1438,7 +1729,54 @@ document.addEventListener("click", async (event) => {
         body: JSON.stringify({ presetId }),
       });
       await loadInstances();
+      const latest = state.instances.find((item) => item.id === iid);
+      state.modelDrafts[iid] = createModelDraft(latest?.model || null);
       setFlash("已应用预设模型配置。");
+      return;
+    }
+
+    if (action === "start-model-auth") {
+      const iid = actionEl.getAttribute("data-instance-id");
+      setBusy(`model-auth-start:${iid}`);
+      await requestJson(`/api/instances/${iid}/model-auth/start`, { method: "POST" });
+      await loadInstances();
+      setFlash("模型登录流程已启动。");
+      return;
+    }
+
+    if (action === "cancel-model-auth") {
+      const iid = actionEl.getAttribute("data-instance-id");
+      setBusy(`model-auth-cancel:${iid}`);
+      await requestJson(`/api/instances/${iid}/model-auth/cancel`, { method: "POST" });
+      await loadInstances();
+      setFlash("模型登录已取消。");
+      return;
+    }
+
+    if (action === "edit-preset") {
+      const presetId = actionEl.getAttribute("data-preset-id");
+      const preset = (state.modelPresets || []).find((item) => item.id === presetId);
+      if (!preset) throw new Error("预设不存在。");
+      loadAdminPresetIntoDraft(preset);
+      render();
+      return;
+    }
+
+    if (action === "cancel-edit-preset") {
+      resetAdminPresetDraft();
+      render();
+      return;
+    }
+
+    if (action === "filter-preset-provider" && actionEl instanceof HTMLSelectElement) {
+      state.adminPresetFilters.providerKey = actionEl.value || "";
+      render();
+      return;
+    }
+
+    if (action === "filter-preset-auth" && actionEl instanceof HTMLSelectElement) {
+      state.adminPresetFilters.authType = actionEl.value || "";
+      render();
       return;
     }
 
@@ -1463,6 +1801,9 @@ document.addEventListener("click", async (event) => {
       state.onboardData = {};
       state.registerData = {};
       state.modelPresets = [];
+      state.modelProviders = [];
+      state.modelDrafts = {};
+      state.adminPresetDraft = null;
       state.instanceTab = "run";
       updatePolling();
       navigate("#/login");

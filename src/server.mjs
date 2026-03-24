@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { hashPassword, verifyPassword } from "./auth.mjs";
@@ -8,6 +9,13 @@ import {
   getInstancePaths,
   writeInstanceFiles,
 } from "./openclaw-config.mjs";
+import {
+  buildProviderConfigFromModel,
+  getModelProviderDefinition,
+  listModelProviders,
+  normalizeModelSelection,
+  sanitizeModelSelectionPayload,
+} from "./model-providers.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 import {
   execInstanceShell,
@@ -17,8 +25,10 @@ import {
   inspectInstance,
   refreshRunnerImage,
   restartInstance,
+  sendInteractiveInput,
   setRuntimeLogger,
   startInstance,
+  startInteractiveInstanceCommand,
   startWechatBindJob,
   stopInstance,
   warmRunnerImageInBackground,
@@ -67,6 +77,7 @@ setRuntimeLogger(logServer);
 
 const wechatJobs = new Map();
 const provisioningJobs = new Map();
+const modelAuthJobs = new Map();
 
 function validatePassword(password) {
   return String(password || "").length >= 8;
@@ -117,25 +128,7 @@ function sanitizeInvitePayload(payload = {}) {
 }
 
 function sanitizeModelPayload(payload, existingModel = null) {
-  const providerId = String(payload.providerId || existingModel?.providerId || "openai")
-    .trim()
-    .toLowerCase();
-  const modelId = String(payload.modelId || existingModel?.modelId || "").trim();
-  const apiMode = String(payload.apiMode || existingModel?.apiMode || "openai-responses").trim();
-  const baseUrl = String(payload.baseUrl || existingModel?.baseUrl || "").trim();
-  const apiKey = String(payload.apiKey || "").trim() || existingModel?.apiKey || "";
-
-  if (!providerId || !modelId || !apiMode || !apiKey) {
-    throw new Error("模型配置不完整，请填写 provider、model、api 模式和 key。");
-  }
-
-  return {
-    providerId,
-    modelId,
-    apiMode,
-    baseUrl,
-    apiKey,
-  };
+  return sanitizeModelSelectionPayload(payload, existingModel);
 }
 
 function sanitizePluginsPayload(payload, existingPlugins = null) {
@@ -395,15 +388,15 @@ function updateProvisioning(instanceId, patch) {
   });
 }
 
-function startProvisioningJob(instanceId) {
+function startProvisioningJob(instanceId, instanceSnapshot = null) {
   if (provisioningJobs.has(instanceId)) {
     return provisioningJobs.get(instanceId);
   }
 
   const job = (async () => {
     try {
-      const initialDatabase = loadDatabase(dataDir);
-      const initialInstance = initialDatabase.instances.find((record) => record.id === instanceId);
+      const initialInstance = instanceSnapshot
+        || loadDatabase(dataDir).instances.find((record) => record.id === instanceId);
       if (!initialInstance) {
         return;
       }
@@ -482,6 +475,125 @@ function patchWechatState(instanceId, patch) {
     mergeWechatPairedAccounts(target);
     target.updatedAt = nowIso();
   });
+}
+
+function patchModelAuthState(instanceId, patch) {
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instanceId);
+    if (!target) {
+      return;
+    }
+
+    target.modelAuth = {
+      ...(target.modelAuth || {}),
+      ...patch,
+      updatedAt: nowIso(),
+    };
+    target.updatedAt = nowIso();
+  });
+}
+
+function extractLastUrl(text) {
+  const matches = String(text || "").match(/https?:\/\/[^\s"'<>]+/g);
+  return matches?.length ? matches.at(-1) : "";
+}
+
+function extractPromptLabel(text) {
+  const matches = [...String(text || "").matchAll(/◆\s+([^\n\r]+)/g)];
+  if (matches.length) {
+    return String(matches.at(-1)?.[1] || "").trim();
+  }
+
+  const fallback = [...String(text || "").matchAll(/(Paste [^\n\r]+|Enter [^\n\r]+)$/gim)];
+  return fallback.length ? String(fallback.at(-1)?.[1] || "").trim() : "";
+}
+
+function inferModelAuthState(output, definition, current = {}) {
+  const text = String(output || "");
+  const promptLabel = extractPromptLabel(text);
+  const authUrl = extractLastUrl(text);
+  const needsInput =
+    Boolean(promptLabel) ||
+    /paste .*below/i.test(text) ||
+    /paste .*redirect/i.test(text) ||
+    /paste .*token/i.test(text) ||
+    /enter the redirect url/i.test(text);
+
+  let message = current.message || "正在执行登录流程。";
+  if (definition?.authType === "device_code" && authUrl) {
+    message = "请在浏览器完成授权，CLI 会自动轮询结果。";
+  } else if (needsInput) {
+    message = "CLI 正在等待输入。";
+  }
+
+  return {
+    status: needsInput ? "waiting_input" : "running",
+    message,
+    outputSnippet: trimTo(text, 4000),
+    authUrl,
+    promptLabel,
+    needsInput,
+  };
+}
+
+function buildModelAuthCommand(definition) {
+  return `openclaw models auth login --provider ${definition.authProviderId} --method ${definition.authMethodId}`;
+}
+
+function readInstanceOpenClawConfig(instanceId) {
+  const { homeDir } = getInstancePaths(dataDir, instanceId);
+  return readJsonFile(path.join(homeDir, "openclaw.json"), null);
+}
+
+function syncInstanceModelProviderConfig(instanceId) {
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instanceId);
+    if (!target?.model) {
+      return;
+    }
+
+    const model = normalizeModelSelection(target.model);
+    if (!model) {
+      return;
+    }
+
+    const config = readInstanceOpenClawConfig(instanceId) || {};
+    const providerConfig = config?.models?.providers?.[model.providerId];
+    const primaryModel = config?.agents?.defaults?.model?.primary;
+
+    target.model = {
+      ...model,
+      providerConfig: providerConfig && typeof providerConfig === "object" ? providerConfig : buildProviderConfigFromModel(model),
+      modelId: typeof primaryModel === "string" && primaryModel.startsWith(`${model.providerId}/`)
+        ? primaryModel.slice(model.providerId.length + 1)
+        : model.modelId,
+    };
+    target.updatedAt = nowIso();
+  });
+}
+
+async function ensureInstanceRunning(instance) {
+  const runtimeState = await inspectInstance(instance);
+  if (runtimeState.running) {
+    return instance;
+  }
+
+  const paths = writeInstanceFiles(dataDir, instance);
+  await startInstance(projectRoot, paths, instance);
+  instance.status = "running";
+  instance.updatedAt = nowIso();
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+
+    target.status = "running";
+    target.updatedAt = instance.updatedAt;
+  });
+
+  return instance;
 }
 
 async function handleRegister(request, response) {
@@ -803,14 +915,8 @@ async function handleCreateInstance(request, response) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    model = {
-      providerId: preset.providerId,
-      modelId: preset.modelId,
-      apiMode: preset.apiMode,
-      baseUrl: preset.baseUrl || "",
-      apiKey: preset.apiKey || "",
-    };
-  } else if (body.providerId || body.modelId || body.apiKey) {
+    model = sanitizeModelPayload(preset);
+  } else if (body.providerKey || body.providerId || body.modelId || body.apiKey) {
     try {
       model = sanitizeModelPayload(body);
     } catch (error) {
@@ -839,7 +945,7 @@ async function handleCreateInstance(request, response) {
     draft.instances.push(instance);
   });
 
-  startProvisioningJob(instance.id);
+  startProvisioningJob(instance.id, instance);
   logServer("info", `用户已提交实例创建：${instance.id}`, {
     userId: user.id,
     instanceName: instance.name,
@@ -854,6 +960,11 @@ async function handleCreateInstance(request, response) {
 async function handleUpdateModel(request, response, instanceId) {
   const user = requireUser(request, response);
   if (!user) {
+    return;
+  }
+
+  if (modelAuthJobs.has(instanceId)) {
+    sendJson(response, 409, { error: "模型登录任务进行中，暂时不能修改模型配置。" });
     return;
   }
 
@@ -878,13 +989,7 @@ async function handleUpdateModel(request, response, instanceId) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    instance.model = {
-      providerId: preset.providerId,
-      modelId: preset.modelId,
-      apiMode: preset.apiMode,
-      baseUrl: preset.baseUrl || "",
-      apiKey: preset.apiKey || "",
-    };
+    instance.model = sanitizeModelPayload(preset, instance.model);
   } else {
     try {
       instance.model = sanitizeModelPayload(body, instance.model);
@@ -893,6 +998,16 @@ async function handleUpdateModel(request, response, instanceId) {
       return;
     }
   }
+
+  instance.modelAuth = {
+    status: "idle",
+    updatedAt: nowIso(),
+    message: "",
+    outputSnippet: "",
+    authUrl: "",
+    promptLabel: "",
+    needsInput: false,
+  };
 
   instance.updatedAt = nowIso();
   const paths = writeInstanceFiles(dataDir, instance);
@@ -966,6 +1081,202 @@ async function handleUpdatePlugins(request, response, instanceId) {
   sendJson(response, 200, {
     instance: publicInstanceForHost(instance, resolveRequestHost(request)),
   });
+}
+
+async function handleListModelProviders(request, response) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  sendJson(response, 200, {
+    providers: listModelProviders(),
+  });
+}
+
+async function handleStartModelAuth(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  if (modelAuthJobs.has(instanceId)) {
+    sendJson(response, 409, { error: "当前实例已有模型登录任务在执行中。" });
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  instance.model = normalizeModelSelection(instance.model);
+  if (!instance.model) {
+    sendJson(response, 400, { error: "请先保存模型配置。" });
+    return;
+  }
+
+  const definition = getModelProviderDefinition(instance.model.providerKey);
+  if (!definition?.supportsInteractiveAuth) {
+    sendJson(response, 400, { error: "当前模型不需要交互式登录。" });
+    return;
+  }
+
+  await ensureInstanceRunning(instance);
+
+  patchModelAuthState(instance.id, {
+    status: "starting",
+    message: "正在启动模型登录流程。",
+    outputSnippet: "",
+    authUrl: "",
+    promptLabel: "",
+    needsInput: false,
+  });
+
+  const command = buildModelAuthCommand(definition);
+  const runtimeEnv = definition.forceRemoteOAuth
+    ? {
+        SSH_CONNECTION: "127.0.0.1 2222 2222",
+        SSH_CLIENT: "127.0.0.1 2222 2222",
+        SSH_TTY: "/dev/pts/1",
+      }
+    : {};
+
+  const job = startInteractiveInstanceCommand(instance, command, {
+    env: runtimeEnv,
+    timeoutMs: 15 * 60 * 1000,
+  }, {
+    onUpdate: ({ output }) => {
+      patchModelAuthState(instance.id, inferModelAuthState(output, definition));
+    },
+    onExit: async ({ code, signal, timedOut, output }) => {
+      const modelJob = modelAuthJobs.get(instance.id);
+      const cancelled = Boolean(modelJob?.cancelRequested);
+      modelAuthJobs.delete(instance.id);
+
+      if (timedOut) {
+        patchModelAuthState(instance.id, {
+          status: "error",
+          message: "模型登录超时，请重试。",
+          outputSnippet: trimTo(output, 4000),
+          needsInput: false,
+        });
+        return;
+      }
+
+      if (cancelled || signal === "SIGTERM") {
+        patchModelAuthState(instance.id, {
+          status: "cancelled",
+          message: "模型登录已取消。",
+          outputSnippet: trimTo(output, 4000),
+          needsInput: false,
+        });
+        return;
+      }
+
+      if (code === 0) {
+        syncInstanceModelProviderConfig(instance.id);
+        try {
+          await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+        } catch {}
+        patchModelAuthState(instance.id, {
+          status: "success",
+          message: "模型登录已完成。",
+          outputSnippet: trimTo(output, 4000),
+          needsInput: false,
+          promptLabel: "",
+        });
+        return;
+      }
+
+      patchModelAuthState(instance.id, {
+        status: "error",
+        message: "模型登录失败，请查看输出信息。",
+        outputSnippet: trimTo(output, 4000),
+        needsInput: false,
+      });
+    },
+  });
+
+  modelAuthJobs.set(instance.id, {
+    ...job,
+    cancelRequested: false,
+  });
+
+  const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
+  sendJson(response, 202, {
+    instance: publicInstanceForHost(latest, resolveRequestHost(request)),
+  });
+}
+
+async function handleModelAuthInput(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  const job = modelAuthJobs.get(instance.id);
+  if (!job) {
+    sendJson(response, 409, { error: "当前没有等待输入的模型登录任务。" });
+    return;
+  }
+
+  let body;
+  try {
+    body = await parseRequestBody(request);
+  } catch {
+    sendJson(response, 400, { error: "请求体不是合法 JSON。" });
+    return;
+  }
+
+  const text = String(body.text || "").trim();
+  if (!text) {
+    sendJson(response, 400, { error: "请输入要提交给 CLI 的内容。" });
+    return;
+  }
+
+  sendInteractiveInput(job, `${text}\n`);
+  patchModelAuthState(instance.id, {
+    status: "running",
+    message: "输入已发送，等待 CLI 继续处理。",
+    needsInput: false,
+  });
+
+  const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
+  sendJson(response, 202, {
+    instance: publicInstanceForHost(latest, resolveRequestHost(request)),
+  });
+}
+
+async function handleCancelModelAuth(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  const job = modelAuthJobs.get(instance.id);
+  if (!job) {
+    sendJson(response, 409, { error: "当前没有进行中的模型登录任务。" });
+    return;
+  }
+
+  job.cancelRequested = true;
+  job.cancel();
+
+  sendJson(response, 200, { ok: true });
 }
 
 async function handleStartInstance(request, response, instanceId) {
@@ -1139,6 +1450,61 @@ async function handleWechatBind(request, response, instanceId) {
   });
 }
 
+function findInstanceForProxy(user, instanceId) {
+  const database = loadDatabase(dataDir);
+  const instance = database.instances.find((record) => record.id === instanceId);
+  if (!instance) {
+    return null;
+  }
+
+  if (user.role === "admin" || instance.userId === user.id) {
+    return instance;
+  }
+
+  return null;
+}
+
+function proxyRequest(request, response, instance, subPath, queryString) {
+  const targetPort = instance.port;
+  const targetPath = `/${subPath}${queryString ? `?${queryString}` : ""}`;
+
+  const headers = { ...request.headers };
+  delete headers.host;
+  delete headers.cookie;
+  headers.authorization = `Bearer ${instance.gatewayToken}`;
+
+  const proxyReq = http.request(
+    {
+      hostname: "127.0.0.1",
+      port: targetPort,
+      path: targetPath,
+      method: request.method,
+      headers,
+      timeout: 30_000,
+    },
+    (proxyRes) => {
+      response.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(response, { end: true });
+    },
+  );
+
+  proxyReq.on("timeout", () => {
+    proxyReq.destroy();
+    if (!response.headersSent) {
+      sendJson(response, 502, { error: "代理请求超时。" });
+    }
+  });
+
+  proxyReq.on("error", (error) => {
+    logServer("error", `代理请求失败：${request.method} ${targetPath}`, error);
+    if (!response.headersSent) {
+      sendJson(response, 502, { error: "无法连接到实例服务。" });
+    }
+  });
+
+  request.pipe(proxyReq, { end: true });
+}
+
 function serveStaticFile(requestPath, response) {
   const targetPath = path.join(publicDir, requestPath === "/" ? "index.html" : requestPath.slice(1));
   const resolvedPath = path.resolve(targetPath);
@@ -1216,6 +1582,11 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && pathname === "/api/model-providers") {
+      await handleListModelProviders(request, response);
+      return;
+    }
+
     if (request.method === "POST" && pathname === "/api/instances") {
       await handleCreateInstance(request, response);
       return;
@@ -1275,6 +1646,26 @@ const server = http.createServer(async (request, response) => {
         }
         const stats = await getInstanceStats(instance);
         sendJson(response, 200, { stats });
+        return;
+      }
+    }
+
+    const instanceModelAuthMatch = pathname.match(/^\/api\/instances\/([^/]+)\/model-auth\/(start|input|cancel)$/);
+    if (instanceModelAuthMatch) {
+      const [, instanceId, action] = instanceModelAuthMatch;
+
+      if (request.method === "POST" && action === "start") {
+        await handleStartModelAuth(request, response, instanceId);
+        return;
+      }
+
+      if (request.method === "POST" && action === "input") {
+        await handleModelAuthInput(request, response, instanceId);
+        return;
+      }
+
+      if (request.method === "POST" && action === "cancel") {
+        await handleCancelModelAuth(request, response, instanceId);
         return;
       }
     }
@@ -1400,9 +1791,13 @@ const server = http.createServer(async (request, response) => {
       const presets = (database.modelPresets || []).map((p) => ({
         id: p.id,
         name: p.name,
+        providerKey: p.providerKey,
         providerId: p.providerId,
         modelId: p.modelId,
         apiMode: p.apiMode,
+        authType: p.authType,
+        authProviderId: p.authProviderId,
+        authMethodId: p.authMethodId,
         baseUrl: p.baseUrl || "",
         createdAt: p.createdAt,
       }));
@@ -1440,6 +1835,42 @@ const server = http.createServer(async (request, response) => {
     }
 
     const presetDeleteMatch = pathname.match(/^\/api\/admin\/model-presets\/([^/]+)$/);
+    if (presetDeleteMatch && request.method === "PUT") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) return;
+      const [, presetId] = presetDeleteMatch;
+      let body;
+      try { body = await parseRequestBody(request); } catch {
+        sendJson(response, 400, { error: "请求体不是合法 JSON。" });
+        return;
+      }
+      const name = sanitizeName(body.name);
+      if (!name) { sendJson(response, 400, { error: "预设名称不能为空。" }); return; }
+      const database = loadDatabase(dataDir);
+      const existingPreset = (database.modelPresets || []).find((preset) => preset.id === presetId);
+      if (!existingPreset) {
+        sendJson(response, 404, { error: "预设不存在。" });
+        return;
+      }
+      let model;
+      try { model = sanitizeModelPayload(body, existingPreset); } catch (error) {
+        sendJson(response, 400, { error: error.message });
+        return;
+      }
+      const preset = {
+        ...existingPreset,
+        name,
+        ...model,
+      };
+      mutateDatabase(dataDir, (draft) => {
+        const target = (draft.modelPresets || []).find((item) => item.id === presetId);
+        if (!target) return;
+        Object.assign(target, preset);
+      });
+      sendJson(response, 200, { preset: { ...preset, apiKey: undefined } });
+      return;
+    }
+
     if (presetDeleteMatch && request.method === "DELETE") {
       const user = requireUser(request, response, { requireAdmin: true });
       if (!user) return;
@@ -1456,12 +1887,93 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
+    const proxyMatch = pathname.match(/^\/proxy\/([^/]+)(\/.*)?$/);
+    if (proxyMatch) {
+      const [, proxyInstanceId, rest] = proxyMatch;
+      const user = getSessionUser(request);
+      if (!user) {
+        sendJson(response, 401, { error: "请先登录。" });
+        return;
+      }
+
+      const instance = findInstanceForProxy(user, proxyInstanceId);
+      if (!instance) {
+        sendJson(response, 403, { error: "无权访问此实例。" });
+        return;
+      }
+
+      const subPath = (rest || "/").slice(1);
+      proxyRequest(request, response, instance, subPath, url.search.slice(1));
+      return;
+    }
+
     serveStaticFile(pathname, response);
   } catch (error) {
     logServer("error", `请求处理失败：${request.method} ${request.url || ""}`, error);
     sendJson(response, 500, {
       error: String(error.message || error),
     });
+  }
+});
+
+server.on("upgrade", (request, socket, head) => {
+  try {
+    const url = new URL(request.url, `http://${request.headers.host || "127.0.0.1"}`);
+    const proxyMatch = url.pathname.match(/^\/proxy\/([^/]+)(\/.*)?$/);
+    if (!proxyMatch) {
+      socket.destroy();
+      return;
+    }
+
+    const [, proxyInstanceId, rest] = proxyMatch;
+    const user = getSessionUser(request);
+    if (!user) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const instance = findInstanceForProxy(user, proxyInstanceId);
+    if (!instance) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
+    const subPath = (rest || "/").slice(1);
+    const targetPath = `/${subPath}${url.search}`;
+
+    const target = net.connect(instance.port, "127.0.0.1", () => {
+      const headers = { ...request.headers };
+      delete headers.cookie;
+      headers.host = `127.0.0.1:${instance.port}`;
+      headers.authorization = `Bearer ${instance.gatewayToken}`;
+
+      let rawHeader = `${request.method} ${targetPath} HTTP/1.1\r\n`;
+      for (const [key, value] of Object.entries(headers)) {
+        rawHeader += `${key}: ${value}\r\n`;
+      }
+      rawHeader += "\r\n";
+
+      target.write(rawHeader);
+      if (head.length > 0) {
+        target.write(head);
+      }
+      socket.pipe(target);
+      target.pipe(socket);
+    });
+
+    target.on("error", (error) => {
+      logServer("error", `WebSocket 代理连接失败：${proxyInstanceId}`, error);
+      socket.destroy();
+    });
+
+    socket.on("error", () => {
+      target.destroy();
+    });
+  } catch (error) {
+    logServer("error", "WebSocket upgrade 处理失败", error);
+    socket.destroy();
   }
 });
 

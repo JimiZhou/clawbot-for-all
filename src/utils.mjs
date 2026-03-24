@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { normalizeModelSelection } from "./model-providers.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export function ensureDir(dirPath) {
@@ -183,8 +184,9 @@ export function publicInstance(instance) {
 }
 
 export function publicInstanceForHost(instance, requestHost) {
+  const normalizedModel = normalizeModelSelection(instance.model);
   const dashboardUrl = requestHost
-    ? buildDashboardUrl(requestHost, instance.port)
+    ? buildDashboardUrl(requestHost, instance.port, instance.id)
     : instance.dashboardUrl;
 
   return {
@@ -205,15 +207,29 @@ export function publicInstanceForHost(instance, requestHost) {
       message: "实例已就绪。",
       updatedAt: instance.updatedAt,
     },
-    model: instance.model
+    model: normalizedModel
       ? {
-          providerId: instance.model.providerId,
-          modelId: instance.model.modelId,
-          apiMode: instance.model.apiMode,
-          baseUrl: instance.model.baseUrl,
-          apiKeyMasked: maskSecret(instance.model.apiKey),
+          providerKey: normalizedModel.providerKey,
+          providerId: normalizedModel.providerId,
+          modelId: normalizedModel.modelId,
+          apiMode: normalizedModel.apiMode,
+          authType: normalizedModel.authType,
+          authProviderId: normalizedModel.authProviderId,
+          authMethodId: normalizedModel.authMethodId,
+          baseUrl: normalizedModel.baseUrl,
+          apiKeyMasked: maskSecret(normalizedModel.apiKey),
+          extra: normalizedModel.extra || {},
         }
       : null,
+    modelAuth: instance.modelAuth || {
+      status: "idle",
+      updatedAt: null,
+      message: "",
+      outputSnippet: "",
+      authUrl: "",
+      promptLabel: "",
+      needsInput: false,
+    },
     plugins: withWechatPluginEnabled(instance.plugins),
     wechatBinding: instance.wechatBinding || {
       status: "idle",
@@ -226,7 +242,11 @@ export function publicInstanceForHost(instance, requestHost) {
   };
 }
 
-export function buildDashboardUrl(requestHost, port) {
+export function buildDashboardUrl(requestHost, port, instanceId) {
+  if (instanceId) {
+    return `/proxy/${instanceId}/`;
+  }
+
   const fallbackHostname = "127.0.0.1";
   const rawHost = String(requestHost || "").trim();
   if (!rawHost) {

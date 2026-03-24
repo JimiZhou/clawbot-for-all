@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { buildProviderConfigFromModel, normalizeModelSelection } from "./model-providers.mjs";
 import { ensureDir, nowIso, slugify, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
@@ -20,6 +21,7 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
   const createdAt = nowIso();
   const port = INSTANCE_BASE_PORT + nextIndex;
   const baseSlug = slugify(name);
+  const normalizedModel = normalizeModelSelection(model);
   return {
     id,
     userId,
@@ -39,16 +41,17 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
       message: "正在创建实例目录与默认配置。",
       updatedAt: createdAt,
     },
-    model: model
-      ? {
-          providerId: model.providerId,
-          modelId: model.modelId,
-          apiMode: model.apiMode,
-          baseUrl: model.baseUrl,
-          apiKey: model.apiKey,
-        }
-      : null,
+    model: normalizedModel,
     plugins: withWechatPluginEnabled(),
+    modelAuth: {
+      status: "idle",
+      updatedAt: null,
+      message: "",
+      outputSnippet: "",
+      authUrl: "",
+      promptLabel: "",
+      needsInput: false,
+    },
     wechatBinding: {
       status: "idle",
       updatedAt: null,
@@ -68,6 +71,7 @@ export function ensureInstanceLayout(paths) {
 }
 
 export function buildOpenClawConfig(instance) {
+  const normalizedModel = normalizeModelSelection(instance.model);
   const config = {
     gateway: {
       bind: "lan",
@@ -82,9 +86,10 @@ export function buildOpenClawConfig(instance) {
     },
   };
 
-  if (instance.model) {
-    const providerId = instance.model.providerId;
-    const modelId = instance.model.modelId;
+  if (normalizedModel) {
+    const providerId = normalizedModel.providerId;
+    const modelId = normalizedModel.modelId;
+    const providerConfig = buildProviderConfigFromModel(normalizedModel);
 
     config.agents = {
       defaults: {
@@ -95,32 +100,14 @@ export function buildOpenClawConfig(instance) {
       },
     };
 
-    config.models = {
-      mode: "merge",
-      providers: {
-        [providerId]: {
-          api: instance.model.apiMode,
-          ...(instance.model.baseUrl ? { baseUrl: instance.model.baseUrl } : {}),
-          ...(instance.model.apiKey ? { apiKey: instance.model.apiKey } : {}),
-          models: [
-            {
-              id: modelId,
-              name: modelId,
-              reasoning: true,
-              input: ["text"],
-              cost: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-              },
-              contextWindow: 128000,
-              maxTokens: 32000,
-            },
-          ],
+    if (providerConfig) {
+      config.models = {
+        mode: "merge",
+        providers: {
+          [providerId]: providerConfig,
         },
-      },
-    };
+      };
+    }
   } else {
     config.agents = {
       defaults: {
