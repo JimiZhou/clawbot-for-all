@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { normalizeModelSelection } from "./model-providers.mjs";
+import { normalizeModelChain, normalizeModelSelection } from "./model-providers.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export function ensureDir(dirPath) {
@@ -184,7 +184,8 @@ export function publicInstance(instance) {
 }
 
 export function publicInstanceForHost(instance, requestHost) {
-  const normalizedModel = normalizeModelSelection(instance.model);
+  const modelChain = normalizeModelChain(instance.modelChain, instance.model);
+  const normalizedModel = modelChain[0] || normalizeModelSelection(instance.model);
   const dashboardUrl = requestHost
     ? buildDashboardUrl(requestHost, instance.port, instance.id)
     : instance.dashboardUrl;
@@ -221,6 +222,18 @@ export function publicInstanceForHost(instance, requestHost) {
           extra: normalizedModel.extra || {},
         }
       : null,
+    modelChain: modelChain.map((model) => ({
+      providerKey: model.providerKey,
+      providerId: model.providerId,
+      modelId: model.modelId,
+      apiMode: model.apiMode,
+      authType: model.authType,
+      authProviderId: model.authProviderId,
+      authMethodId: model.authMethodId,
+      baseUrl: model.baseUrl,
+      apiKeyMasked: maskSecret(model.apiKey),
+      extra: model.extra || {},
+    })),
     modelAuth: instance.modelAuth || {
       status: "idle",
       updatedAt: null,
@@ -236,6 +249,7 @@ export function publicInstanceForHost(instance, requestHost) {
       updatedAt: null,
       qrMode: null,
       qrPayload: "",
+      qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
     },

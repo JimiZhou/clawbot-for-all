@@ -522,20 +522,19 @@ function inferWechatState(output, current = {}) {
     status: current.status || "starting",
     updatedAt: nowIso(),
     outputSnippet: tailSnippet(output || current.outputSnippet || "", 2000),
+    qrLink: current.qrLink || "",
   };
 
   const dataUrl = extractQrDataUrl(output);
+  const link = extractQrLink(output);
+  if (link) {
+    next.qrLink = link;
+  }
+
   if (dataUrl) {
     next.status = "waiting_scan";
     next.qrMode = "image";
     next.qrPayload = dataUrl;
-  }
-
-  const link = extractQrLink(output);
-  if (!next.qrPayload && link) {
-    next.status = "waiting_scan";
-    next.qrMode = "image";
-    next.qrPayload = link;
   }
 
   const asciiQr = extractAsciiQr(output);
@@ -599,6 +598,7 @@ export function startWechatBindJob(instance, handlers = {}) {
         updatedAt: nowIso(),
         qrMode: null,
         qrPayload: "",
+        qrLink: "",
         outputSnippet: tailSnippet(`${combinedOutput}\n微信绑定命令执行超时。`, 3000),
       });
       return;
@@ -626,6 +626,7 @@ export function startWechatBindJob(instance, handlers = {}) {
         updatedAt: nowIso(),
         qrMode: null,
         qrPayload: "",
+        qrLink: "",
         outputSnippet: tailSnippet(String(error.message || error), 3000),
       });
   });

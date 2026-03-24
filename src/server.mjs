@@ -13,6 +13,7 @@ import {
   buildProviderConfigFromModel,
   getModelProviderDefinition,
   listModelProviders,
+  normalizeModelChain,
   normalizeModelSelection,
   sanitizeModelSelectionPayload,
 } from "./model-providers.mjs";
@@ -129,6 +130,42 @@ function sanitizeInvitePayload(payload = {}) {
 
 function sanitizeModelPayload(payload, existingModel = null) {
   return sanitizeModelSelectionPayload(payload, existingModel);
+}
+
+function syncInstanceModelChainShape(instance) {
+  if (!instance) return instance;
+  const modelChain = normalizeModelChain(instance.modelChain, instance.model);
+  instance.modelChain = modelChain;
+  instance.model = modelChain[0] || null;
+  return instance;
+}
+
+function replaceInstanceModelChain(instance, nextModelChain, { keepUpdatedAt = false } = {}) {
+  syncInstanceModelChainShape(instance);
+  instance.modelChain = normalizeModelChain(nextModelChain, null);
+  instance.model = instance.modelChain[0] || null;
+  if (!keepUpdatedAt) {
+    instance.updatedAt = nowIso();
+  }
+  return instance;
+}
+
+function parseBooleanFlag(value, fallback = false) {
+  if (value === undefined || value === null || value === "") {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
+}
+
+function sortModelPresets(presets = []) {
+  return [...presets].sort((left, right) => {
+    const defaultDelta = Number(Boolean(right?.isDefault)) - Number(Boolean(left?.isDefault));
+    if (defaultDelta !== 0) return defaultDelta;
+    return new Date(right?.createdAt || 0).getTime() - new Date(left?.createdAt || 0).getTime();
+  });
 }
 
 function sanitizePluginsPayload(payload, existingPlugins = null) {
@@ -328,6 +365,7 @@ function mergeWechatPairedAccounts(instance) {
     updatedAt: binding.updatedAt || (pairedAccounts.length ? nowIso() : null),
     qrMode: binding.qrMode || null,
     qrPayload: binding.qrPayload || "",
+    qrLink: binding.qrLink || "",
     outputSnippet: binding.outputSnippet || "",
     pairedAccounts,
   };
@@ -548,6 +586,7 @@ function readInstanceOpenClawConfig(instanceId) {
 function syncInstanceModelProviderConfig(instanceId) {
   mutateDatabase(dataDir, (draft) => {
     const target = draft.instances.find((record) => record.id === instanceId);
+    syncInstanceModelChainShape(target);
     if (!target?.model) {
       return;
     }
@@ -561,13 +600,14 @@ function syncInstanceModelProviderConfig(instanceId) {
     const providerConfig = config?.models?.providers?.[model.providerId];
     const primaryModel = config?.agents?.defaults?.model?.primary;
 
-    target.model = {
+    const nextPrimary = {
       ...model,
       providerConfig: providerConfig && typeof providerConfig === "object" ? providerConfig : buildProviderConfigFromModel(model),
       modelId: typeof primaryModel === "string" && primaryModel.startsWith(`${model.providerId}/`)
         ? primaryModel.slice(model.providerId.length + 1)
         : model.modelId,
     };
+    replaceInstanceModelChain(target, [nextPrimary, ...target.modelChain.slice(1)], { keepUpdatedAt: true });
     target.updatedAt = nowIso();
   });
 }
@@ -597,9 +637,14 @@ async function ensureInstanceRunning(instance) {
 }
 
 function pickDefaultModelPreset(database) {
-  const presets = Array.isArray(database?.modelPresets) ? database.modelPresets : [];
+  const presets = sortModelPresets(Array.isArray(database?.modelPresets) ? database.modelPresets : []);
   if (!presets.length) {
     return null;
+  }
+
+  const markedDefault = presets.find((preset) => preset?.isDefault);
+  if (markedDefault) {
+    return markedDefault;
   }
 
   const exactOpenAIGpt54 = presets.find((preset) =>
@@ -614,6 +659,7 @@ function pickDefaultModelPreset(database) {
 }
 
 function ensureInstanceDefaultModel(instance) {
+  syncInstanceModelChainShape(instance);
   if (instance?.model) {
     return instance;
   }
@@ -624,16 +670,19 @@ function ensureInstanceDefaultModel(instance) {
     return instance;
   }
 
-  instance.model = sanitizeModelPayload(defaultPreset);
-  instance.updatedAt = nowIso();
+  replaceInstanceModelChain(instance, [sanitizeModelPayload(defaultPreset)]);
 
   mutateDatabase(dataDir, (draft) => {
     const target = draft.instances.find((record) => record.id === instance.id);
-    if (!target || target.model) {
+    if (!target) {
       return;
     }
-
+    syncInstanceModelChainShape(target);
+    if (target.model) {
+      return;
+    }
     target.model = instance.model;
+    target.modelChain = instance.modelChain;
     target.updatedAt = instance.updatedAt;
   });
 
@@ -974,6 +1023,13 @@ async function handleCreateInstance(request, response) {
     }
   }
 
+  if (!model) {
+    sendJson(response, 400, {
+      error: "当前没有可用的默认模型预设。请先由管理员配置一个默认预设，或手动提交模型配置。",
+    });
+    return;
+  }
+
   const existingCount = database.instances.filter((record) => record.userId === user.id).length;
   if (existingCount >= 1) {
     sendJson(response, 409, { error: "每个用户只能创建一个实例。" });
@@ -1029,22 +1085,26 @@ async function handleUpdateModel(request, response, instanceId) {
     sendJson(response, 404, { error: "实例不存在。" });
     return;
   }
+  syncInstanceModelChainShape(instance);
+  const previousFallbacks = instance.modelChain.slice(1);
 
+  let nextPrimary;
   if (body.presetId) {
     const preset = (database.modelPresets || []).find((p) => p.id === body.presetId);
     if (!preset) {
       sendJson(response, 400, { error: "所选模型预设不存在。" });
       return;
     }
-    instance.model = sanitizeModelPayload(preset, instance.model);
+    nextPrimary = sanitizeModelPayload(preset, instance.model);
   } else {
     try {
-      instance.model = sanitizeModelPayload(body, instance.model);
+      nextPrimary = sanitizeModelPayload(body, instance.model);
     } catch (error) {
       sendJson(response, 400, { error: error.message });
       return;
     }
   }
+  replaceInstanceModelChain(instance, [nextPrimary, ...previousFallbacks]);
 
   instance.modelAuth = {
     status: "idle",
@@ -1072,8 +1132,209 @@ async function handleUpdateModel(request, response, instanceId) {
     if (!target) {
       return;
     }
+    syncInstanceModelChainShape(target);
     Object.assign(target, instance);
   });
+
+  sendJson(response, 200, {
+    instance: publicInstanceForHost(instance, resolveRequestHost(request)),
+  });
+}
+
+async function persistInstanceModelConfig(instance) {
+  syncInstanceModelChainShape(instance);
+  const paths = writeInstanceFiles(dataDir, instance);
+  const runtimeState = await inspectInstance(instance);
+
+  if (runtimeState.running) {
+    await restartInstance(projectRoot, paths, instance);
+    instance.status = "running";
+  } else {
+    instance.status = runtimeState.status;
+  }
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+    syncInstanceModelChainShape(target);
+    Object.assign(target, instance);
+  });
+
+  return instance;
+}
+
+async function handleAddInstanceModel(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await parseRequestBody(request);
+  } catch {
+    sendJson(response, 400, { error: "请求体不是合法 JSON。" });
+    return;
+  }
+
+  const database = loadDatabase(dataDir);
+  const instance = database.instances.find((record) => record.id === instanceId && record.userId === user.id);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  syncInstanceModelChainShape(instance);
+
+  let nextModel;
+  if (body.presetId) {
+    const preset = (database.modelPresets || []).find((p) => p.id === body.presetId);
+    if (!preset) {
+      sendJson(response, 400, { error: "所选模型预设不存在。" });
+      return;
+    }
+    nextModel = sanitizeModelPayload(preset);
+  } else {
+    try {
+      nextModel = sanitizeModelPayload(body);
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+      return;
+    }
+  }
+
+  const asPrimary = parseBooleanFlag(body.makePrimary, false) || instance.modelChain.length === 0;
+  const nextChain = asPrimary
+    ? [nextModel, ...instance.modelChain]
+    : [...instance.modelChain, nextModel];
+
+  replaceInstanceModelChain(instance, nextChain);
+  instance.modelAuth = {
+    status: "idle",
+    updatedAt: nowIso(),
+    message: "",
+    outputSnippet: "",
+    authUrl: "",
+    promptLabel: "",
+    needsInput: false,
+  };
+
+  await persistInstanceModelConfig(instance);
+
+  sendJson(response, 200, {
+    instance: publicInstanceForHost(instance, resolveRequestHost(request)),
+  });
+}
+
+async function handleSetPrimaryModel(request, response, instanceId, modelIndex) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  syncInstanceModelChainShape(instance);
+  const index = Number(modelIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= instance.modelChain.length) {
+    sendJson(response, 400, { error: "模型索引无效。" });
+    return;
+  }
+  if (instance.modelChain.length <= 1) {
+    sendJson(response, 400, { error: "至少需要保留一个默认模型。" });
+    return;
+  }
+
+  const nextChain = [...instance.modelChain];
+  const [selected] = nextChain.splice(index, 1);
+  nextChain.unshift(selected);
+  replaceInstanceModelChain(instance, nextChain);
+  await persistInstanceModelConfig(instance);
+
+  sendJson(response, 200, {
+    instance: publicInstanceForHost(instance, resolveRequestHost(request)),
+  });
+}
+
+async function handleReorderInstanceModel(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  let body;
+  try {
+    body = await parseRequestBody(request);
+  } catch {
+    sendJson(response, 400, { error: "请求体不是合法 JSON。" });
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  syncInstanceModelChainShape(instance);
+  const index = Number(body.index);
+  const direction = String(body.direction || "").trim().toLowerCase();
+  if (!Number.isInteger(index) || index < 0 || index >= instance.modelChain.length) {
+    sendJson(response, 400, { error: "模型索引无效。" });
+    return;
+  }
+
+  const delta = direction === "up" ? -1 : direction === "down" ? 1 : 0;
+  const targetIndex = index + delta;
+  if (!delta || targetIndex < 0 || targetIndex >= instance.modelChain.length) {
+    sendJson(response, 400, { error: "无法继续移动当前模型。" });
+    return;
+  }
+
+  const nextChain = [...instance.modelChain];
+  const [selected] = nextChain.splice(index, 1);
+  nextChain.splice(targetIndex, 0, selected);
+  replaceInstanceModelChain(instance, nextChain);
+  await persistInstanceModelConfig(instance);
+
+  sendJson(response, 200, {
+    instance: publicInstanceForHost(instance, resolveRequestHost(request)),
+  });
+}
+
+async function handleDeleteInstanceModel(request, response, instanceId, modelIndex) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  syncInstanceModelChainShape(instance);
+  const index = Number(modelIndex);
+  if (!Number.isInteger(index) || index < 0 || index >= instance.modelChain.length) {
+    sendJson(response, 400, { error: "模型索引无效。" });
+    return;
+  }
+  if (instance.modelChain.length <= 1) {
+    sendJson(response, 400, { error: "至少需要保留一个默认模型。" });
+    return;
+  }
+
+  const nextChain = [...instance.modelChain];
+  nextChain.splice(index, 1);
+  replaceInstanceModelChain(instance, nextChain);
+  await persistInstanceModelConfig(instance);
 
   sendJson(response, 200, {
     instance: publicInstanceForHost(instance, resolveRequestHost(request)),
@@ -1158,7 +1419,7 @@ async function handleStartModelAuth(request, response, instanceId) {
     return;
   }
 
-  instance.model = normalizeModelSelection(instance.model);
+  syncInstanceModelChainShape(instance);
   if (!instance.model) {
     sendJson(response, 400, { error: "请先保存模型配置。" });
     return;
@@ -1445,6 +1706,8 @@ async function handleWechatBind(request, response, instanceId) {
   if (!user) {
     return;
   }
+  const url = new URL(request.url || "", "http://localhost");
+  const forceRegenerate = parseBooleanFlag(url.searchParams.get("force"), false);
 
   const instance = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
   if (!instance) {
@@ -1463,12 +1726,16 @@ async function handleWechatBind(request, response, instanceId) {
     return;
   }
 
-  if (wechatJobs.has(instance.id)) {
+  if (wechatJobs.has(instance.id) && !forceRegenerate) {
     const latest = await refreshInstanceRuntimeState(instance.id);
     sendJson(response, 200, {
       instance: publicInstanceForHost(latest || instance, resolveRequestHost(request)),
     });
     return;
+  }
+
+  if (wechatJobs.has(instance.id) && forceRegenerate) {
+    wechatJobs.get(instance.id)?.cancel?.();
   }
 
   writeInstanceFiles(dataDir, instance);
@@ -1478,20 +1745,32 @@ async function handleWechatBind(request, response, instanceId) {
     updatedAt: nowIso(),
     qrMode: null,
     qrPayload: "",
+    qrLink: "",
     outputSnippet: "已进入容器，正在检查预装微信插件并拉起扫码登录流程。",
   });
 
+  const runId = randomId(8);
   const job = startWechatBindJob(instance, {
     onUpdate: (patch) => {
+      if (wechatJobs.get(instance.id)?.runId !== runId) {
+        return;
+      }
       patchWechatState(instance.id, patch);
     },
     onExit: (patch) => {
+      if (wechatJobs.get(instance.id)?.runId !== runId) {
+        return;
+      }
       patchWechatState(instance.id, patch);
       wechatJobs.delete(instance.id);
     },
   });
 
-  wechatJobs.set(instance.id, job);
+  wechatJobs.set(instance.id, {
+    runId,
+    child: job,
+    cancel: () => job.kill("SIGTERM"),
+  });
 
   const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
   sendJson(response, 202, {
@@ -1638,6 +1917,34 @@ const server = http.createServer(async (request, response) => {
 
     if (request.method === "POST" && pathname === "/api/instances") {
       await handleCreateInstance(request, response);
+      return;
+    }
+
+    const instanceModelsMatch = pathname.match(/^\/api\/instances\/([^/]+)\/models$/);
+    if (instanceModelsMatch && request.method === "POST") {
+      const [, instanceId] = instanceModelsMatch;
+      await handleAddInstanceModel(request, response, instanceId);
+      return;
+    }
+
+    const instanceModelsReorderMatch = pathname.match(/^\/api\/instances\/([^/]+)\/models\/reorder$/);
+    if (instanceModelsReorderMatch && request.method === "POST") {
+      const [, instanceId] = instanceModelsReorderMatch;
+      await handleReorderInstanceModel(request, response, instanceId);
+      return;
+    }
+
+    const instanceModelItemMatch = pathname.match(/^\/api\/instances\/([^/]+)\/models\/(\d+)$/);
+    if (instanceModelItemMatch && request.method === "DELETE") {
+      const [, instanceId, modelIndex] = instanceModelItemMatch;
+      await handleDeleteInstanceModel(request, response, instanceId, modelIndex);
+      return;
+    }
+
+    const instanceModelPrimaryMatch = pathname.match(/^\/api\/instances\/([^/]+)\/models\/(\d+)\/primary$/);
+    if (instanceModelPrimaryMatch && request.method === "POST") {
+      const [, instanceId, modelIndex] = instanceModelPrimaryMatch;
+      await handleSetPrimaryModel(request, response, instanceId, modelIndex);
       return;
     }
 
@@ -1837,9 +2144,10 @@ const server = http.createServer(async (request, response) => {
       const user = requireUser(request, response);
       if (!user) return;
       const database = loadDatabase(dataDir);
-      const presets = (database.modelPresets || []).map((p) => ({
+      const presets = sortModelPresets(database.modelPresets || []).map((p) => ({
         id: p.id,
         name: p.name,
+        isDefault: Boolean(p.isDefault),
         providerKey: p.providerKey,
         providerId: p.providerId,
         modelId: p.modelId,
@@ -1848,6 +2156,8 @@ const server = http.createServer(async (request, response) => {
         authProviderId: p.authProviderId,
         authMethodId: p.authMethodId,
         baseUrl: p.baseUrl || "",
+        hasBaseUrl: Boolean(String(p.baseUrl || "").trim()),
+        hasApiKey: Boolean(String(p.apiKey || "").trim()),
         createdAt: p.createdAt,
       }));
       sendJson(response, 200, { presets });
@@ -1869,17 +2179,43 @@ const server = http.createServer(async (request, response) => {
         sendJson(response, 400, { error: error.message });
         return;
       }
+      const existingPresets = Array.isArray(database.modelPresets) ? database.modelPresets : [];
       const preset = {
         id: `preset_${Date.now().toString(36)}`,
         name,
+        isDefault: parseBooleanFlag(body.isDefault, existingPresets.length === 0),
         ...model,
         createdAt: nowIso(),
       };
       mutateDatabase(dataDir, (draft) => {
         if (!draft.modelPresets) draft.modelPresets = [];
+        if (preset.isDefault) {
+          for (const item of draft.modelPresets) {
+            item.isDefault = false;
+          }
+        }
         draft.modelPresets.push(preset);
       });
       sendJson(response, 201, { preset: { ...preset, apiKey: undefined } });
+      return;
+    }
+
+    const presetDefaultMatch = pathname.match(/^\/api\/admin\/model-presets\/([^/]+)\/default$/);
+    if (presetDefaultMatch && request.method === "POST") {
+      const user = requireUser(request, response, { requireAdmin: true });
+      if (!user) return;
+      const [, presetId] = presetDefaultMatch;
+      const database = loadDatabase(dataDir);
+      if (!(database.modelPresets || []).some((preset) => preset.id === presetId)) {
+        sendJson(response, 404, { error: "预设不存在。" });
+        return;
+      }
+      mutateDatabase(dataDir, (draft) => {
+        for (const item of draft.modelPresets || []) {
+          item.isDefault = item.id === presetId;
+        }
+      });
+      sendJson(response, 200, { ok: true });
       return;
     }
 
@@ -1909,9 +2245,15 @@ const server = http.createServer(async (request, response) => {
       const preset = {
         ...existingPreset,
         name,
+        isDefault: parseBooleanFlag(body.isDefault, Boolean(existingPreset.isDefault)),
         ...model,
       };
       mutateDatabase(dataDir, (draft) => {
+        if (preset.isDefault) {
+          for (const item of draft.modelPresets || []) {
+            item.isDefault = false;
+          }
+        }
         const target = (draft.modelPresets || []).find((item) => item.id === presetId);
         if (!target) return;
         Object.assign(target, preset);
@@ -1930,7 +2272,15 @@ const server = http.createServer(async (request, response) => {
         return;
       }
       mutateDatabase(dataDir, (draft) => {
+        const deletingDefault = (draft.modelPresets || []).find((p) => p.id === presetId)?.isDefault;
         draft.modelPresets = (draft.modelPresets || []).filter((p) => p.id !== presetId);
+        if (deletingDefault && draft.modelPresets.length && !draft.modelPresets.some((p) => p.isDefault)) {
+          const fallbackPreset = pickDefaultModelPreset(draft) || draft.modelPresets[0];
+          const target = (draft.modelPresets || []).find((p) => p.id === fallbackPreset?.id);
+          if (target) {
+            target.isDefault = true;
+          }
+        }
       });
       sendJson(response, 200, { ok: true });
       return;

@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { buildProviderConfigFromModel, normalizeModelSelection } from "./model-providers.mjs";
+import { buildProviderConfigFromModel, normalizeModelChain, normalizeModelSelection } from "./model-providers.mjs";
 import { ensureDir, nowIso, slugify, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
@@ -22,6 +22,7 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
   const port = INSTANCE_BASE_PORT + nextIndex;
   const baseSlug = slugify(name);
   const normalizedModel = normalizeModelSelection(model);
+  const modelChain = normalizeModelChain(normalizedModel ? [normalizedModel] : [], normalizedModel);
   return {
     id,
     userId,
@@ -41,7 +42,8 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
       message: "正在创建实例目录与默认配置。",
       updatedAt: createdAt,
     },
-    model: normalizedModel,
+    model: modelChain[0] || null,
+    modelChain,
     plugins: withWechatPluginEnabled(),
     modelAuth: {
       status: "idle",
@@ -57,6 +59,7 @@ export function createInstanceRecord({ userId, name, model, nextIndex }) {
       updatedAt: null,
       qrMode: null,
       qrPayload: "",
+      qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
     },
@@ -70,8 +73,46 @@ export function ensureInstanceLayout(paths) {
   ensureDir(paths.logsDir);
 }
 
+function mergeProviderConfigs(modelChain) {
+  const providers = {};
+
+  for (const model of modelChain) {
+    const providerId = String(model?.providerId || "").trim();
+    if (!providerId) continue;
+    const providerConfig = buildProviderConfigFromModel(model);
+    if (!providerConfig || typeof providerConfig !== "object") continue;
+
+    if (!providers[providerId]) {
+      providers[providerId] = {
+        ...providerConfig,
+        models: Array.isArray(providerConfig.models) ? [...providerConfig.models] : [],
+      };
+      continue;
+    }
+
+    const target = providers[providerId];
+    for (const [key, value] of Object.entries(providerConfig)) {
+      if (key === "models") continue;
+      if ((target[key] === undefined || target[key] === null || target[key] === "") && value !== undefined) {
+        target[key] = value;
+      }
+    }
+
+    const existingIds = new Set((target.models || []).map((entry) => String(entry?.id || "")));
+    for (const modelEntry of providerConfig.models || []) {
+      const modelId = String(modelEntry?.id || "");
+      if (!modelId || existingIds.has(modelId)) continue;
+      existingIds.add(modelId);
+      target.models.push(modelEntry);
+    }
+  }
+
+  return providers;
+}
+
 export function buildOpenClawConfig(instance) {
-  const normalizedModel = normalizeModelSelection(instance.model);
+  const modelChain = normalizeModelChain(instance.modelChain, instance.model);
+  const normalizedModel = modelChain[0] || null;
   const config = {
     gateway: {
       bind: "lan",
@@ -89,23 +130,25 @@ export function buildOpenClawConfig(instance) {
   if (normalizedModel) {
     const providerId = normalizedModel.providerId;
     const modelId = normalizedModel.modelId;
-    const providerConfig = buildProviderConfigFromModel(normalizedModel);
+    const providers = mergeProviderConfigs(modelChain);
+    const fallbacks = modelChain
+      .slice(1)
+      .map((item) => `${item.providerId}/${item.modelId}`);
 
     config.agents = {
       defaults: {
         workspace: "/workspace",
         model: {
           primary: `${providerId}/${modelId}`,
+          ...(fallbacks.length ? { fallbacks } : {}),
         },
       },
     };
 
-    if (providerConfig) {
+    if (Object.keys(providers).length) {
       config.models = {
         mode: "merge",
-        providers: {
-          [providerId]: providerConfig,
-        },
+        providers,
       };
     }
   } else {

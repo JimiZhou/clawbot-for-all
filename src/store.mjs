@@ -1,5 +1,5 @@
 import path from "node:path";
-import { normalizeModelSelection } from "./model-providers.mjs";
+import { normalizeModelChain, normalizeModelSelection } from "./model-providers.mjs";
 import { ensureDir, nowIso, randomId, readJsonFile, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
@@ -27,9 +27,11 @@ function normalizeUser(user) {
 }
 
 function normalizeInstance(instance) {
+  const modelChain = normalizeModelChain(instance.modelChain, instance.model);
   return {
     ...instance,
-    model: normalizeModelSelection(instance.model),
+    model: modelChain[0] || normalizeModelSelection(instance.model),
+    modelChain,
     provisioning: instance.provisioning || {
       status: "ready",
       percent: 100,
@@ -52,6 +54,7 @@ function normalizeInstance(instance) {
       updatedAt: null,
       qrMode: null,
       qrPayload: "",
+      qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
     },
@@ -74,6 +77,7 @@ function normalizeModelPreset(preset) {
 
   const normalizedModel = normalizeModelSelection(preset);
   return {
+    isDefault: false,
     ...preset,
     ...(normalizedModel || {}),
   };

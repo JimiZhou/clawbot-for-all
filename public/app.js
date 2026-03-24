@@ -10,7 +10,7 @@ const MODEL_API_MODES = [
 const LOG_TAIL_OPTIONS = [100, 200, 400, 800];
 
 const DEFAULT_PLUGIN_TEMPLATE = {
-  allow: [],
+  allow: ["openclaw-weixin"],
   entries: {
     "openclaw-weixin": {
       enabled: true,
@@ -43,6 +43,7 @@ const state = {
   onboardStep: 1,
   onboardData: {},
   registerData: {},
+  instancesSignature: "",
   modelPresets: [],
   modelProviders: [],
   modelDrafts: {},
@@ -52,11 +53,17 @@ const state = {
     authType: "",
   },
   instanceTab: "run",
+  userMenuOpen: false,
+  lastSceneKey: "",
+  motionMarks: {},
+  serverLogsSignature: "",
+  statsSignaturesByInstanceId: {},
 };
 
 const app = document.querySelector("#app");
 let pollingTimer = null;
 let statsTimer = null;
+let renderQueued = false;
 
 /* ── Helpers ──────────────────────────────────────────── */
 
@@ -118,18 +125,74 @@ function toInputDatetime(value) {
 }
 
 function setFlash(message, tone = "info") {
+  if (state.flash?.message === message && state.flash?.tone === tone) return;
   state.flash = { message, tone };
   render();
 }
 
 function setBusy(key) {
+  if (state.busyKey === key) return;
   state.busyKey = key;
   render();
 }
 
 function clearBusy() {
+  if (!state.busyKey) return;
   state.busyKey = "";
   render();
+}
+
+function markMotion(name, duration = 520) {
+  if (!name) return;
+  const expiresAt = Date.now() + duration;
+  state.motionMarks[name] = expiresAt;
+  setTimeout(() => {
+    if (state.motionMarks[name] !== expiresAt) return;
+    delete state.motionMarks[name];
+    render();
+  }, duration + 40);
+}
+
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  window.requestAnimationFrame(() => {
+    renderQueued = false;
+    renderNow();
+  });
+}
+
+function hasMotion(name) {
+  return Boolean(name) && Number(state.motionMarks[name] || 0) > Date.now();
+}
+
+function currentSceneKey(route) {
+  if (!state.user) {
+    return route === "#/register" ? "guest:register" : "guest:login";
+  }
+  if (state.user.mustChangePassword) {
+    return "user:force-password";
+  }
+  if (route === "#/change-password") {
+    return "user:password-settings";
+  }
+  if (state.user.role === "admin" && (route === "#/admin" || route.startsWith("#/admin"))) {
+    return `admin:${state.adminTab}`;
+  }
+  if (state.instances.length === 0) {
+    return `onboard:${state.onboardStep}`;
+  }
+  return `instance:${state.instanceTab}`;
+}
+
+function consumeSceneMotion(route) {
+  const sceneKey = currentSceneKey(route);
+  const animate = state.lastSceneKey !== sceneKey;
+  state.lastSceneKey = sceneKey;
+  return {
+    sceneKey,
+    animate,
+  };
 }
 
 function syncPasswordGate(error) {
@@ -202,6 +265,7 @@ function getAdminPresetDraft() {
     state.adminPresetDraft = {
       name: "",
       editingPresetId: "",
+      isDefault: false,
       ...createModelDraft(null),
     };
   }
@@ -213,6 +277,7 @@ function resetAdminPresetDraft() {
   state.adminPresetDraft = {
     name: "",
     editingPresetId: "",
+    isDefault: false,
     ...createModelDraft(null),
   };
 }
@@ -259,6 +324,7 @@ function syncAdminPresetDraftFromForm(form) {
   state.adminPresetDraft = {
     ...(state.adminPresetDraft || getAdminPresetDraft()),
     ...data,
+    isDefault: Boolean(form.querySelector('input[name="isDefault"]')?.checked),
   };
 }
 
@@ -266,6 +332,7 @@ function loadAdminPresetIntoDraft(preset) {
   state.adminPresetDraft = {
     name: preset.name || "",
     editingPresetId: preset.id || "",
+    isDefault: Boolean(preset.isDefault),
     providerKey: preset.providerKey || defaultProviderKey(),
     providerId: preset.providerId || "",
     modelId: preset.modelId || "",
@@ -386,6 +453,52 @@ function authTypeLabel(authType) {
   }
 }
 
+function presetConfigStatus(preset) {
+  const authType = String(preset?.authType || "").trim();
+  const hasApiKey = Boolean(preset?.hasApiKey);
+  const hasBaseUrl = Boolean(preset?.hasBaseUrl);
+
+  if (authType === "api_key") {
+    return {
+      label: hasApiKey ? "已配置密钥" : "缺少密钥",
+      tone: hasApiKey ? "good" : "warn",
+      detail: hasBaseUrl ? "URL: 自定义" : "URL: 默认",
+    };
+  }
+
+  if (["device_code", "oauth_redirect_paste", "external_token_paste"].includes(authType)) {
+    return {
+      label: "需用户登录",
+      tone: "accent",
+      detail: hasBaseUrl ? "URL: 自定义" : "URL: 默认",
+    };
+  }
+
+  if (authType === "custom_gateway") {
+    const ready = hasBaseUrl || hasApiKey;
+    return {
+      label: ready ? "已配置接入" : "待补充接入",
+      tone: ready ? "good" : "warn",
+      detail: hasBaseUrl ? "URL: 自定义" : "URL: 未填写",
+    };
+  }
+
+  return {
+    label: "待确认",
+    tone: "muted",
+    detail: hasBaseUrl ? "URL: 自定义" : "URL: 默认",
+  };
+}
+
+function presetConfigMeta(preset) {
+  const status = presetConfigStatus(preset);
+  return `
+    <div class="preset-config-meta">
+      ${statusBadge(status.label, status.tone)}
+      <span class="text-muted">${escapeHtml(status.detail)}</span>
+    </div>`;
+}
+
 /* ── Polling ──────────────────────────────────────────── */
 
 function updatePolling() {
@@ -422,9 +535,7 @@ function updatePolling() {
   if (runningInstance) {
     loadInstanceStats(runningInstance.id).catch(() => {});
     statsTimer = setInterval(() => {
-      loadInstanceStats(runningInstance.id).then(() => {
-        render();
-      }).catch(() => {});
+      loadInstanceStats(runningInstance.id).catch(() => {});
     }, 5000);
   }
 }
@@ -439,12 +550,18 @@ async function loadSession() {
 async function loadInstances() {
   if (!state.user || state.user.mustChangePassword) {
     state.instances = [];
+    state.instancesSignature = "";
     updatePolling();
     return;
   }
   const payload = await requestJson("/api/instances", { method: "GET" });
-  state.instances = payload.instances;
+  const nextInstances = payload.instances || [];
+  const nextSignature = JSON.stringify(nextInstances);
+  const changed = nextSignature !== state.instancesSignature;
+  state.instances = nextInstances;
+  state.instancesSignature = nextSignature;
   updatePolling();
+  if (changed) render();
 }
 
 async function loadInvites() {
@@ -477,25 +594,44 @@ async function loadAdminRunnerImage() {
 async function loadAdminServerLogs(tail = state.serverLogs?.tail || 400) {
   if (!state.user || state.user.role !== "admin") return;
   const payload = await requestJson(`/api/admin/server-logs?tail=${tail}`, { method: "GET" });
-  state.serverLogs = payload.logs || {
+  const nextLogs = payload.logs || {
     text: "",
     path: "",
     totalLines: 0,
     updatedAt: null,
     tail,
   };
+  const nextSignature = JSON.stringify(nextLogs);
+  const changed = nextSignature !== state.serverLogsSignature;
+  state.serverLogs = nextLogs;
+  state.serverLogsSignature = nextSignature;
+  if (changed) render();
 }
 
 async function loadLogs(instanceId, tail) {
   tail = tail || state.logTailByInstanceId[instanceId] || 200;
   state.logTailByInstanceId[instanceId] = tail;
   const payload = await requestJson(`/api/instances/${instanceId}/logs?tail=${tail}`, { method: "GET" });
-  state.logsByInstanceId[instanceId] = payload.logs || "";
+  const nextLogs = payload.logs || "";
+  if (state.logsByInstanceId[instanceId] !== nextLogs) {
+    state.logsByInstanceId[instanceId] = nextLogs;
+    render();
+    return;
+  }
+  state.logsByInstanceId[instanceId] = nextLogs;
 }
 
 async function loadInstanceStats(instanceId) {
   const payload = await requestJson(`/api/instances/${instanceId}/stats`, { method: "GET" });
-  state.statsByInstanceId[instanceId] = payload.stats || null;
+  const nextStats = payload.stats || null;
+  const nextSignature = JSON.stringify(nextStats);
+  if (state.statsSignaturesByInstanceId[instanceId] !== nextSignature) {
+    state.statsByInstanceId[instanceId] = nextStats;
+    state.statsSignaturesByInstanceId[instanceId] = nextSignature;
+    render();
+    return;
+  }
+  state.statsByInstanceId[instanceId] = nextStats;
 }
 
 async function loadModelPresets() {
@@ -503,9 +639,35 @@ async function loadModelPresets() {
   const payload = await requestJson("/api/model-presets", { method: "GET" });
   state.modelPresets = payload.presets || [];
   if (!state.onboardData.presetId && state.modelPresets.length) {
-    state.onboardData.presetId = state.modelPresets[0].id;
+    state.onboardData.presetId = state.modelPresets.find((item) => item.isDefault)?.id || state.modelPresets[0].id;
   }
   render();
+}
+
+function isRenderableImageSource(src) {
+  const value = String(src || "").trim();
+  return /^data:image\//i.test(value) || /\.(png|svg|jpe?g|gif|webp)(\?.*)?$/i.test(value);
+}
+
+function bindingQrImageSource(binding) {
+  if (binding?.qrMode === "ascii" && binding.qrPayload) {
+    return asciiQrToSvgDataUrl(binding.qrPayload);
+  }
+
+  if (binding?.qrMode === "image" && isRenderableImageSource(binding.qrPayload)) {
+    return binding.qrPayload;
+  }
+
+  return "";
+}
+
+function bindingLogSnippet(binding) {
+  const text = String(binding?.outputSnippet || "");
+  if (!text) return "";
+  const filtered = text
+    .split(/\r?\n/)
+    .filter((line) => !(/[█▀▄▌▐▓▒░#]/.test(line) && line.trim().length >= 10));
+  return filtered.join("\n").trim();
 }
 
 async function loadModelProviders() {
@@ -656,12 +818,13 @@ function navBar(items = [], right = "") {
 }
 
 function userDropdown() {
+  const isOpen = Boolean(state.userMenuOpen);
   return `<div class="user-dropdown">
-    <button class="user-dropdown-trigger" type="button" data-action="toggle-user-menu" aria-haspopup="menu" aria-expanded="false" aria-controls="user-menu">
+    <button class="user-dropdown-trigger" type="button" data-action="toggle-user-menu" aria-haspopup="menu" aria-expanded="${isOpen ? "true" : "false"}" aria-controls="user-menu">
       <span class="user-name">${escapeHtml(state.user?.name || "")}</span>
       <span class="user-dropdown-arrow">&#9662;</span>
     </button>
-    <div class="user-dropdown-menu" id="user-menu" role="menu">
+    <div class="user-dropdown-menu ${isOpen ? "open" : ""}" id="user-menu" role="menu">
       <a class="user-dropdown-item" href="#/change-password">修改密码</a>
       <button class="user-dropdown-item" type="button" data-action="logout">退出登录</button>
     </div>
@@ -911,6 +1074,13 @@ function adminImagesTab() {
 function adminServerLogsTab() {
   const logs = state.serverLogs || {};
   const currentTail = logs.tail || 400;
+  const logRefreshing = state.busyKey === "server-logs";
+  const logFresh = hasMotion("server-logs");
+  const logPanelClass = [
+    "log-output",
+    logRefreshing ? "log-output-refreshing" : "",
+    logFresh ? "log-output-fresh" : "",
+  ].filter(Boolean).join(" ");
 
   return `
     <div class="card">
@@ -937,8 +1107,8 @@ function adminServerLogsTab() {
       </div>
 
       ${logs.text
-        ? `<pre class="log-output">${escapeHtml(logs.text)}</pre>`
-        : `<p class="empty-text">当前还没有 server 日志。</p>`
+        ? `<pre class="${logPanelClass}">${escapeHtml(logs.text)}</pre>`
+        : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">当前还没有 server 日志。</p>`
       }
     </div>`;
 }
@@ -1064,6 +1234,10 @@ function adminPresetsTab() {
           </label>
         </div>
         ${fieldRows.map((row) => `<div class="form-row">${row.map((field) => renderModelField(field, draft, null)).join("")}</div>`).join("")}
+        <label class="form-label form-check">
+          <input type="checkbox" name="isDefault" value="1" ${draft.isDefault ? "checked" : ""} />
+          <span>设为默认预设</span>
+        </label>
         ${selectedProvider?.supportsInteractiveAuth ? `<p class="text-muted">该预设只保存模型选择。用户应用到实例后，仍需在实例配置页完成登录。</p>` : ""}
         <div class="form-actions">
           ${editing ? `<button class="btn btn-ghost" type="button" data-action="cancel-edit-preset">取消编辑</button>` : ""}
@@ -1095,14 +1269,16 @@ function adminPresetsTab() {
         ${Object.entries(groupedPresets).map(([providerKey, entries]) => `
           <h4 class="sub-title">${escapeHtml(modelProviderByKey(providerKey)?.label || providerKey)} (${entries.length})</h4>
           <table class="table">
-            <thead><tr><th>名称</th><th>Model</th><th>认证方式</th><th>API Mode</th><th>操作</th></tr></thead>
+            <thead><tr><th>名称</th><th>Model</th><th>认证方式</th><th>API Mode</th><th>配置状态</th><th>操作</th></tr></thead>
             <tbody>
               ${entries.map((p) => `<tr>
-                <td><strong>${escapeHtml(p.name)}</strong></td>
+                <td><strong>${escapeHtml(p.name)}</strong>${p.isDefault ? ` <span class="status-badge status-success">默认</span>` : ""}</td>
                 <td>${escapeHtml(p.modelId)}</td>
                 <td>${escapeHtml(authTypeLabel(p.authType))}</td>
                 <td>${escapeHtml(p.apiMode)}</td>
+                <td>${presetConfigMeta(p)}</td>
                 <td>
+                  ${!p.isDefault ? `<button class="btn btn-secondary btn-sm" data-action="set-default-preset" data-preset-id="${p.id}">${state.busyKey === `default-preset:${p.id}` ? "设置中..." : "设为默认"}</button>` : ""}
                   <button class="btn btn-ghost btn-sm" data-action="edit-preset" data-preset-id="${p.id}">编辑</button>
                   <button class="btn btn-danger btn-sm" data-action="delete-preset" data-preset-id="${p.id}">${state.busyKey === `delete-preset:${p.id}` ? "删除中..." : "删除"}</button>
                 </td>
@@ -1166,8 +1342,9 @@ function onboardStep2() {
           <label class="preset-card ${selectedPreset === p.id ? "preset-selected" : ""}">
             <input type="radio" name="presetId" value="${escapeHtml(p.id)}" ${selectedPreset === p.id ? "checked" : ""} data-action="select-preset" />
             <div class="preset-card-body">
-              <strong>${escapeHtml(p.name)}</strong>
+              <strong>${escapeHtml(p.name)}${p.isDefault ? " · 默认" : ""}</strong>
               <span class="text-muted">${escapeHtml(modelProviderByKey(p.providerKey)?.label || p.providerId)}/${escapeHtml(p.modelId)}</span>
+              ${presetConfigMeta(p)}
             </div>
           </label>
         `).join("")}
@@ -1187,7 +1364,7 @@ function parsePercent(str) {
 function instanceStatsCard(inst) {
   const stats = state.statsByInstanceId[inst.id];
   if (!stats) {
-    return `<div class="stats-card card"><span class="text-muted">正在加载资源监控...</span></div>`;
+    return `<div class="stats-card card loading-panel"><span class="text-muted">正在加载资源监控...</span></div>`;
   }
 
   const cpuVal = parsePercent(stats.cpuPercent);
@@ -1320,6 +1497,11 @@ function instanceRunTab(inst) {
 
 function bindingContent(inst, binding, pairedAccounts) {
   const bindingActive = ["starting", "waiting_scan", "scanned"].includes(binding.status);
+  const qrImageSrc = bindingQrImageSource(binding);
+  const qrLink = binding.qrLink || "";
+  const visibleLog = bindingLogSnippet(binding);
+  const hasGeneratedBefore = Boolean(binding.qrPayload || qrLink || visibleLog || binding.status === "error" || binding.status === "connected");
+  const primaryLabel = hasGeneratedBefore ? "重新生成二维码" : "生成配对二维码";
 
   if (binding.status === "starting") {
     return `
@@ -1327,13 +1509,16 @@ function bindingContent(inst, binding, pairedAccounts) {
         <div class="spinner"></div>
         <p>正在安装微信插件并拉起扫码流程...</p>
       </div>
-      ${binding.outputSnippet ? `<pre class="log-output small-log">${escapeHtml(binding.outputSnippet)}</pre>` : ""}`;
+      ${visibleLog ? `<pre class="log-output small-log">${escapeHtml(visibleLog)}</pre>` : ""}`;
   }
 
   return `
-    ${!bindingActive ? `<button class="btn btn-primary btn-sm" data-action="wechat-bind" data-instance-id="${inst.id}">${state.busyKey === `wechat:${inst.id}` ? "生成中..." : "生成配对二维码"}</button>` : ""}
-    ${qrMarkup(binding)}
-    ${binding.outputSnippet && binding.status !== "connected" ? `<pre class="log-output small-log">${escapeHtml(binding.outputSnippet)}</pre>` : ""}
+    <div class="form-actions" style="justify-content:flex-start;margin-bottom:8px">
+      <button class="btn ${bindingActive ? "btn-secondary" : "btn-primary"} btn-sm" data-action="${bindingActive ? "wechat-rebind" : "wechat-bind"}" data-instance-id="${inst.id}">${state.busyKey === `wechat:${inst.id}` ? "生成中..." : primaryLabel}</button>
+      ${qrLink ? `<a class="btn btn-ghost btn-sm" href="${qrLink}" target="_blank" rel="noreferrer">打开微信扫码页</a>` : ""}
+    </div>
+    ${qrMarkup(binding, qrImageSrc, qrLink)}
+    ${visibleLog && binding.status !== "connected" ? `<pre class="log-output small-log">${escapeHtml(visibleLog)}</pre>` : ""}
     ${pairedAccounts.length ? `
       <h4 class="sub-title">已配对账号 (${pairedAccounts.length})</h4>
       <div class="paired-list">${pairedAccounts.map((a) => `
@@ -1344,6 +1529,30 @@ function bindingContent(inst, binding, pairedAccounts) {
         </div>`).join("")}</div>` : ""}`;
 }
 
+function renderModelChain(inst) {
+  const chain = Array.isArray(inst.modelChain) ? inst.modelChain : (inst.model ? [inst.model] : []);
+  if (!chain.length) {
+    return `<p class="empty-text">当前还没有可用模型。创建实例后会先写入一个默认模型，你也可以继续添加 fallback。</p>`;
+  }
+
+  return `
+    <div class="paired-list">
+      ${chain.map((model, index) => `
+        <div class="paired-item model-chain-item">
+          <strong>${index === 0 ? "默认" : `Fallback ${index}`}</strong>
+          <span>${escapeHtml(model.providerId)}/${escapeHtml(model.modelId)}</span>
+          <span>${escapeHtml(modelProviderByKey(model.providerKey)?.label || model.providerKey || model.apiMode)}</span>
+          <div class="model-chain-actions">
+            ${index !== 0 ? `<button class="btn btn-secondary btn-sm" data-action="set-primary-model" data-instance-id="${inst.id}" data-model-index="${index}">设为默认</button>` : ""}
+            ${index > 0 ? `<button class="btn btn-ghost btn-sm" data-action="move-model-up" data-instance-id="${inst.id}" data-model-index="${index}">上移</button>` : ""}
+            ${index < chain.length - 1 ? `<button class="btn btn-ghost btn-sm" data-action="move-model-down" data-instance-id="${inst.id}" data-model-index="${index}">下移</button>` : ""}
+            <button class="btn btn-danger btn-sm" data-action="delete-model" data-instance-id="${inst.id}" data-model-index="${index}" ${chain.length === 1 ? "disabled" : ""}>删除</button>
+          </div>
+        </div>
+      `).join("")}
+    </div>`;
+}
+
 function instanceConfigTab(inst) {
   const logs = state.logsByInstanceId[inst.id];
   const currentTail = state.logTailByInstanceId[inst.id] || 200;
@@ -1352,6 +1561,13 @@ function instanceConfigTab(inst) {
   const selectedProvider = modelProviderByKey(draft.providerKey);
   const providerOptions = state.modelProviders || [];
   const fieldRows = chunkList(selectedProvider?.fields || [], 2);
+  const logRefreshing = state.busyKey === `logs:${inst.id}`;
+  const logFresh = hasMotion(`logs:${inst.id}`);
+  const logPanelClass = [
+    "log-output",
+    logRefreshing ? "log-output-refreshing" : "",
+    logFresh ? "log-output-fresh" : "",
+  ].filter(Boolean).join(" ");
 
   return `
     <div class="instance-header">
@@ -1367,19 +1583,24 @@ function instanceConfigTab(inst) {
 
     <div class="card">
       <h3 class="card-title">模型配置</h3>
-      ${!inst.model ? `<p class="text-muted" style="margin-bottom:12px">尚未配置模型，选择预设或自行填写。</p>` : ""}
+      <p class="text-muted" style="margin-bottom:12px">创建实例时只会写入 1 个默认模型。后续你可以继续添加模型，并指定默认模型与 fallback 顺序。</p>
+      ${renderModelChain(inst)}
 
       ${presets.length ? `
-        <div class="config-section-label">使用预设模型</div>
+        <div class="config-section-label">从预设添加模型</div>
         <div class="preset-list compact">
           ${presets.map((p) => `
-            <button class="preset-card-btn" data-action="apply-preset" data-preset-id="${p.id}" data-instance-id="${inst.id}">
+            <div class="preset-card-btn">
               <strong>${escapeHtml(p.name)}</strong>
               <span class="text-muted">${escapeHtml(p.providerId)}/${escapeHtml(p.modelId)}</span>
-            </button>
+              <div class="model-chain-actions">
+                <button class="btn btn-secondary btn-sm" data-action="apply-preset" data-preset-id="${p.id}" data-instance-id="${inst.id}">设为默认</button>
+                <button class="btn btn-ghost btn-sm" data-action="add-preset-fallback" data-preset-id="${p.id}" data-instance-id="${inst.id}">添加为 fallback</button>
+              </div>
+            </div>
           `).join("")}
         </div>
-        <div class="config-section-label">或自定义配置</div>
+        <div class="config-section-label">或手动添加模型</div>
       ` : ""}
 
       ${providerOptions.length ? `
@@ -1391,7 +1612,10 @@ function instanceConfigTab(inst) {
             </select>
           </label>
           ${fieldRows.map((row) => `<div class="form-row">${row.map((field) => renderModelField(field, draft, inst.model)).join("")}</div>`).join("")}
-          <button class="btn btn-secondary btn-sm" type="submit">${state.busyKey === `model:${inst.id}` ? "保存中..." : "保存模型配置"}</button>
+          <div class="form-actions" style="justify-content:flex-start">
+            <button class="btn btn-secondary btn-sm" type="submit">${state.busyKey === `model:${inst.id}` ? "保存中..." : "保存为默认模型"}</button>
+            <button class="btn btn-ghost btn-sm" type="button" data-action="add-model-fallback" data-instance-id="${inst.id}">${state.busyKey === `model-add:${inst.id}` ? "添加中..." : "添加为 fallback"}</button>
+          </div>
         </form>
         ${renderModelAuthPanel(inst, draft)}
       ` : `<p class="empty-text">正在加载可用 Provider 列表...</p>`}
@@ -1415,7 +1639,7 @@ function instanceConfigTab(inst) {
           <button class="btn btn-ghost btn-sm" type="submit">${state.busyKey === `logs:${inst.id}` ? "刷新中..." : "刷新日志"}</button>
         </form>
       </div>
-      ${logs ? `<pre class="log-output">${escapeHtml(logs)}</pre>` : `<p class="empty-text">点击刷新查看容器日志。</p>`}
+      ${logs ? `<pre class="${logPanelClass}">${escapeHtml(logs)}</pre>` : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">点击刷新查看容器日志。</p>`}
     </div>`;
 }
 
@@ -1430,39 +1654,43 @@ function provisioningBanner(inst, percent, provisioning) {
     </div>`;
 }
 
-function qrMarkup(binding) {
-  if (!binding?.qrMode) return "";
-  if (binding.qrMode === "image" && binding.qrPayload) {
-    return `<div class="qr-display"><img src="${binding.qrPayload}" alt="微信绑定二维码" /></div>`;
-  }
-  if (binding.qrMode === "ascii" && binding.qrPayload) {
-    const src = asciiQrToSvgDataUrl(binding.qrPayload);
-    return `<div class="qr-display"><img src="${src}" alt="微信绑定二维码" /></div>`;
-  }
-  return "";
+function qrMarkup(binding, qrImageSrc, qrLink) {
+  if (!qrImageSrc && !qrLink) return "";
+  return `
+    <div class="qr-display">
+      ${qrImageSrc ? `<img src="${qrImageSrc}" alt="微信绑定二维码" />` : `<p class="text-muted">当前未拿到可直接渲染的二维码图片，请使用上方链接继续扫码。</p>`}
+      ${qrLink ? `<p class="qr-link-hint">如果二维码过期，点击“重新生成二维码”即可拿到新的扫码入口。</p>` : ""}
+    </div>`;
 }
 
 /* ── Render ───────────────────────────────────────────── */
 
-function render() {
+function renderNow() {
   const route = currentRoute();
+  const motion = consumeSceneMotion(route);
   let html = flashMarkup();
+  let viewHtml = "";
 
   if (!state.user) {
-    html += route === "#/register" ? registerView() : loginView();
+    viewHtml = route === "#/register" ? registerView() : loginView();
   } else if (state.user.mustChangePassword) {
-    html += changePasswordView();
+    viewHtml = changePasswordView();
   } else if (route === "#/change-password") {
-    html += settingsPasswordView();
+    viewHtml = settingsPasswordView();
   } else if (state.user.role === "admin" && (route === "#/admin" || route.startsWith("#/admin"))) {
-    html += adminView();
+    viewHtml = adminView();
   } else if (state.instances.length === 0) {
-    html += onboardView();
+    viewHtml = onboardView();
   } else {
-    html += instanceView();
+    viewHtml = instanceView();
   }
 
+  html += `<div class="scene-shell ${motion.animate ? "scene-enter" : ""}" data-scene="${escapeHtml(motion.sceneKey)}">${viewHtml}</div>`;
   app.innerHTML = html;
+}
+
+function render() {
+  scheduleRender();
 }
 
 /* ── Event: form submit ───────────────────────────────── */
@@ -1538,9 +1766,13 @@ document.addEventListener("submit", async (event) => {
       syncAdminPresetDraftFromForm(form);
       setBusy("create-preset");
       const presetId = String(data.editingPresetId || "").trim();
+      const payload = {
+        ...data,
+        isDefault: Boolean(form.querySelector('input[name="isDefault"]')?.checked),
+      };
       await requestJson(presetId ? `/api/admin/model-presets/${presetId}` : "/api/admin/model-presets", {
         method: presetId ? "PUT" : "POST",
-        body: JSON.stringify(data),
+        body: JSON.stringify(payload),
       });
       await loadModelPresets();
       resetAdminPresetDraft();
@@ -1599,6 +1831,7 @@ document.addEventListener("submit", async (event) => {
       const tail = Number(data.tail || 200);
       setBusy(`logs:${instanceId}`);
       await loadLogs(instanceId, tail);
+      markMotion(`logs:${instanceId}`);
       setFlash("日志已刷新。");
       return;
     }
@@ -1607,6 +1840,7 @@ document.addEventListener("submit", async (event) => {
       const tail = Number(data.tail || 400);
       setBusy("server-logs");
       await loadAdminServerLogs(tail);
+      markMotion("server-logs");
       setFlash("Server 日志已刷新。");
       return;
     }
@@ -1682,11 +1916,10 @@ document.addEventListener("click", async (event) => {
   if (!(target instanceof HTMLElement)) return;
 
   // Close user dropdown when clicking outside
-  const menu = document.getElementById("user-menu");
-  const trigger = document.querySelector(".user-dropdown-trigger");
-  if (menu?.classList.contains("open") && !target.closest(".user-dropdown")) {
-    menu.classList.remove("open");
-    if (trigger) trigger.setAttribute("aria-expanded", "false");
+  if (state.userMenuOpen && !target.closest(".user-dropdown")) {
+    state.userMenuOpen = false;
+    document.getElementById("user-menu")?.classList.remove("open");
+    document.querySelector(".user-dropdown-trigger")?.setAttribute("aria-expanded", "false");
   }
 
   const actionEl = target.closest("[data-action]");
@@ -1703,11 +1936,8 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "toggle-user-menu") {
-      const menu = document.getElementById("user-menu");
-      if (menu) {
-        const isOpen = menu.classList.toggle("open");
-        actionEl.setAttribute("aria-expanded", String(isOpen));
-      }
+      state.userMenuOpen = !state.userMenuOpen;
+      render();
       return;
     }
 
@@ -1736,6 +1966,69 @@ document.addEventListener("click", async (event) => {
       const latest = state.instances.find((item) => item.id === iid);
       state.modelDrafts[iid] = createModelDraft(latest?.model || null);
       setFlash("已应用预设模型配置。");
+      return;
+    }
+
+    if (action === "add-preset-fallback") {
+      const presetId = actionEl.getAttribute("data-preset-id");
+      const iid = actionEl.getAttribute("data-instance-id");
+      setBusy(`model-add:${iid}`);
+      await requestJson(`/api/instances/${iid}/models`, {
+        method: "POST",
+        body: JSON.stringify({ presetId }),
+      });
+      await loadInstances();
+      setFlash("已添加 fallback 模型。");
+      return;
+    }
+
+    if (action === "add-model-fallback" && instanceId) {
+      const draft = state.modelDrafts[instanceId] || {};
+      setBusy(`model-add:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/models`, {
+        method: "POST",
+        body: JSON.stringify(draft),
+      });
+      await loadInstances();
+      const latest = state.instances.find((item) => item.id === instanceId);
+      state.modelDrafts[instanceId] = createModelDraft(latest?.model || null);
+      setFlash("已添加 fallback 模型。");
+      return;
+    }
+
+    if (action === "set-primary-model" && instanceId) {
+      const modelIndex = actionEl.getAttribute("data-model-index");
+      setBusy(`model-primary:${instanceId}:${modelIndex}`);
+      await requestJson(`/api/instances/${instanceId}/models/${modelIndex}/primary`, { method: "POST" });
+      await loadInstances();
+      const latest = state.instances.find((item) => item.id === instanceId);
+      state.modelDrafts[instanceId] = createModelDraft(latest?.model || null);
+      setFlash("默认模型已更新。");
+      return;
+    }
+
+    if ((action === "move-model-up" || action === "move-model-down") && instanceId) {
+      const modelIndex = actionEl.getAttribute("data-model-index");
+      setBusy(`model-order:${instanceId}:${modelIndex}:${action}`);
+      await requestJson(`/api/instances/${instanceId}/models/reorder`, {
+        method: "POST",
+        body: JSON.stringify({ index: Number(modelIndex), direction: action === "move-model-up" ? "up" : "down" }),
+      });
+      await loadInstances();
+      const latest = state.instances.find((item) => item.id === instanceId);
+      state.modelDrafts[instanceId] = createModelDraft(latest?.model || null);
+      setFlash("fallback 顺序已更新。");
+      return;
+    }
+
+    if (action === "delete-model" && instanceId) {
+      const modelIndex = actionEl.getAttribute("data-model-index");
+      setBusy(`model-delete:${instanceId}:${modelIndex}`);
+      await requestJson(`/api/instances/${instanceId}/models/${modelIndex}`, { method: "DELETE" });
+      await loadInstances();
+      const latest = state.instances.find((item) => item.id === instanceId);
+      state.modelDrafts[instanceId] = createModelDraft(latest?.model || null);
+      setFlash("模型已删除。");
       return;
     }
 
@@ -1793,14 +2086,18 @@ document.addEventListener("click", async (event) => {
       setBusy("logout");
       await requestJson("/api/logout", { method: "POST" });
       state.user = null;
+      state.userMenuOpen = false;
       state.instances = [];
+      state.instancesSignature = "";
       state.invites = [];
       state.adminUsers = [];
       state.adminInstances = [];
       state.runnerImage = null;
       state.serverLogs = { text: "", path: "", totalLines: 0, updatedAt: null, tail: 400 };
+      state.serverLogsSignature = "";
       state.logsByInstanceId = {};
       state.statsByInstanceId = {};
+      state.statsSignaturesByInstanceId = {};
       state.onboardStep = 1;
       state.onboardData = {};
       state.registerData = {};
@@ -1965,6 +2262,24 @@ document.addEventListener("click", async (event) => {
       setFlash("微信绑定流程已启动。");
       return;
     }
+
+    if (action === "wechat-rebind" && instanceId) {
+      setBusy(`wechat:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/wechat-bind?force=1`, { method: "POST" });
+      await loadInstances();
+      setFlash("已重新生成微信绑定二维码。");
+      return;
+    }
+
+    if (action === "set-default-preset") {
+      const presetId = actionEl.getAttribute("data-preset-id");
+      setBusy(`default-preset:${presetId}`);
+      await requestJson(`/api/admin/model-presets/${presetId}/default`, { method: "POST" });
+      await loadModelPresets();
+      setFlash("默认模型预设已更新。");
+      render();
+      return;
+    }
   } catch (error) {
     syncPasswordGate(error);
     setFlash(error.message, "error");
@@ -1976,6 +2291,7 @@ document.addEventListener("click", async (event) => {
 /* ── Hash change routing ──────────────────────────────── */
 
 window.addEventListener("hashchange", async () => {
+  state.userMenuOpen = false;
   const route = currentRoute();
 
   if (state.user?.role === "admin" && route === "#/admin") {
@@ -1988,11 +2304,10 @@ window.addEventListener("hashchange", async () => {
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
 
-  const menu = document.getElementById("user-menu");
-  const trigger = document.querySelector(".user-dropdown-trigger");
-  if (menu?.classList.contains("open")) {
-    menu.classList.remove("open");
-    if (trigger) trigger.setAttribute("aria-expanded", "false");
+  if (state.userMenuOpen) {
+    state.userMenuOpen = false;
+    document.getElementById("user-menu")?.classList.remove("open");
+    document.querySelector(".user-dropdown-trigger")?.setAttribute("aria-expanded", "false");
   }
 
   const toast = document.querySelector(".toast-overlay");

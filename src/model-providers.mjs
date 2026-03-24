@@ -208,12 +208,14 @@ const PROVIDER_DEFINITIONS = [
       { name: "baseUrl", label: "Base URL", type: "text", required: false, placeholder: "https://portal.qwen.ai/v1" },
     ],
     buildProviderConfig(model) {
+      const selectedModelId = model.modelId === "vision-model" ? "vision-model" : "coder-model";
       return {
         api: "openai-completions",
         baseUrl: model.baseUrl || "https://portal.qwen.ai/v1",
         models: [
-          buildModelDefinition("coder-model", { name: "Qwen Coder", reasoning: false }),
-          buildModelDefinition("vision-model", { name: "Qwen Vision", reasoning: false, input: ["text", "image"] }),
+          selectedModelId === "vision-model"
+            ? buildModelDefinition("vision-model", { name: "Qwen Vision", reasoning: false, input: ["text", "image"] })
+            : buildModelDefinition("coder-model", { name: "Qwen Coder", reasoning: false }),
         ],
       };
     },
@@ -653,6 +655,34 @@ export function normalizeModelSelection(model) {
   const providerKey = trimString(model.providerKey) || guessProviderKeyFromLegacyModel(model);
   const definition = getModelProviderDefinition(providerKey) || getModelProviderDefinition("custom-provider");
   return normalizeModelCore(definition, model, null);
+}
+
+export function normalizeModelChain(models, fallbackModel = null) {
+  const source = Array.isArray(models) ? models : [];
+  const chain = source
+    .map((item) => normalizeModelSelection(item))
+    .filter(Boolean);
+
+  if (!chain.length) {
+    const normalizedFallback = normalizeModelSelection(fallbackModel);
+    return normalizedFallback ? [normalizedFallback] : [];
+  }
+
+  const seen = new Set();
+  return chain.filter((item) => {
+    const key = [
+      item.providerKey,
+      item.providerId,
+      item.modelId,
+      item.apiMode,
+      item.baseUrl,
+    ].join("::");
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 export function sanitizeModelSelectionPayload(payload = {}, existingModel = null) {
