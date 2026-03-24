@@ -135,16 +135,21 @@ export function buildOpenClawConfig(instance) {
   if (normalizedModel) {
     const providerId = normalizedModel.providerId;
     const modelId = normalizedModel.modelId;
+    const primaryModelRef = `${providerId}/${modelId}`;
     const providers = mergeProviderConfigs(modelChain);
     const fallbacks = modelChain
       .slice(1)
       .map((item) => `${item.providerId}/${item.modelId}`);
 
+    // 同时写入 legacy agent.model，避免不同 OpenClaw 版本读取路径差异导致回落到内置默认模型。
+    config.agent = {
+      model: primaryModelRef,
+    };
     config.agents = {
       defaults: {
         workspace: "/workspace",
         model: {
-          primary: `${providerId}/${modelId}`,
+          primary: primaryModelRef,
           ...(fallbacks.length ? { fallbacks } : {}),
         },
       },

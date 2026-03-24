@@ -244,6 +244,7 @@ logServer("info", "Server 初始化完成。", {
   dataDir,
   serverLogPath: getServerLogPath(),
 });
+void repairInstancesMissingModelInBackground();
 
 function resolveRequestHost(request) {
   return request.headers["x-forwarded-host"] || request.headers.host || "";
@@ -442,6 +443,14 @@ function startProvisioningJob(instanceId, instanceSnapshot = null) {
         || loadDatabase(dataDir).instances.find((record) => record.id === instanceId);
       if (!initialInstance) {
         return;
+      }
+
+      const ensured = ensureInstanceDefaultModel(initialInstance);
+      if (!ensured.instance) {
+        return;
+      }
+      if (ensured.error) {
+        throw new Error(ensured.error);
       }
 
       updateProvisioning(instanceId, {
@@ -656,19 +665,60 @@ function pickDefaultModelPreset(database) {
   return presets[0] || null;
 }
 
+function resolveDefaultRuntimeModel(database) {
+  const defaultPreset = pickDefaultModelPreset(database);
+  if (!defaultPreset) {
+    return {
+      preset: null,
+      model: null,
+      error: "当前实例没有默认模型。请先由管理员配置并设为默认，再启动实例或绑定微信。",
+    };
+  }
+
+  try {
+    return {
+      preset: defaultPreset,
+      model: resolveModelPresetForRuntime(defaultPreset),
+      error: "",
+    };
+  } catch (error) {
+    return {
+      preset: defaultPreset,
+      model: null,
+      error: error.message || "默认模型预设不可用。",
+    };
+  }
+}
+
 function ensureInstanceDefaultModel(instance) {
+  if (!instance) {
+    return {
+      instance: null,
+      changed: false,
+      error: "",
+    };
+  }
+
   syncInstanceModelChainShape(instance);
-  if (instance?.model) {
-    return instance;
+  if (instance.model) {
+    return {
+      instance,
+      changed: false,
+      error: "",
+    };
   }
 
   const database = loadDatabase(dataDir);
-  const defaultPreset = pickDefaultModelPreset(database);
-  if (!defaultPreset) {
-    return instance;
+  const resolved = resolveDefaultRuntimeModel(database);
+  if (!resolved.model) {
+    return {
+      instance,
+      changed: false,
+      error: resolved.error,
+    };
   }
 
-  replaceInstanceModelChain(instance, [sanitizeModelPayload(defaultPreset)]);
+  replaceInstanceModelChain(instance, [resolved.model]);
 
   mutateDatabase(dataDir, (draft) => {
     const target = draft.instances.find((record) => record.id === instance.id);
@@ -684,7 +734,65 @@ function ensureInstanceDefaultModel(instance) {
     target.updatedAt = instance.updatedAt;
   });
 
-  return instance;
+  return {
+    instance,
+    changed: true,
+    error: "",
+  };
+}
+
+async function repairInstancesMissingModelInBackground() {
+  const database = loadDatabase(dataDir);
+  const candidates = (database.instances || []).filter((instance) => {
+    syncInstanceModelChainShape(instance);
+    return !instance.model;
+  });
+
+  if (!candidates.length) {
+    return;
+  }
+
+  const resolved = resolveDefaultRuntimeModel(database);
+  if (!resolved.model) {
+    logServer("warn", "检测到空模型实例，但当前没有可用默认模型，跳过自动修复。", {
+      instanceIds: candidates.map((item) => item.id),
+      error: resolved.error,
+    });
+    return;
+  }
+
+  for (const candidate of candidates) {
+    try {
+      replaceInstanceModelChain(candidate, [resolved.model]);
+
+      mutateDatabase(dataDir, (draft) => {
+        const target = draft.instances.find((record) => record.id === candidate.id);
+        if (!target) {
+          return;
+        }
+        syncInstanceModelChainShape(target);
+        if (target.model) {
+          return;
+        }
+        target.model = candidate.model;
+        target.modelChain = candidate.modelChain;
+        target.updatedAt = candidate.updatedAt;
+      });
+
+      writeInstanceFiles(dataDir, candidate);
+      const runtimeState = await inspectInstance(candidate);
+      if (runtimeState.running) {
+        await execInstanceShell(candidate, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+      }
+
+      logServer("info", `已自动修复空模型实例：${candidate.id}`, {
+        runtimeStatus: runtimeState.status,
+        primaryModel: `${candidate.model.providerId}/${candidate.model.modelId}`,
+      });
+    } catch (error) {
+      logServer("error", `自动修复空模型实例失败：${candidate.id}`, error);
+    }
+  }
 }
 
 async function handleRegister(request, response) {
@@ -1020,15 +1128,12 @@ async function handleCreateInstance(request, response) {
       return;
     }
   } else {
-    const defaultPreset = pickDefaultModelPreset(database);
-    if (defaultPreset) {
-      try {
-        model = resolveModelPresetForRuntime(defaultPreset);
-      } catch (error) {
-        sendJson(response, 400, { error: error.message });
-        return;
-      }
+    const resolvedDefault = resolveDefaultRuntimeModel(database);
+    if (resolvedDefault.error) {
+      sendJson(response, 400, { error: resolvedDefault.error });
+      return;
     }
+    model = resolvedDefault.model;
   }
 
   if (!model) {
@@ -1611,9 +1716,14 @@ async function handleStartInstance(request, response, instanceId) {
     return;
   }
 
-  const instance = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
+  const ensured = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
+  const instance = ensured.instance;
   if (!instance) {
     sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+  if (ensured.error) {
+    sendJson(response, 409, { error: ensured.error });
     return;
   }
 
@@ -1699,9 +1809,14 @@ async function handleRestartGateway(request, response, instanceId) {
     return;
   }
 
-  const instance = findOwnedInstance(user, instanceId);
+  const ensured = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
+  const instance = ensured.instance;
   if (!instance) {
     sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+  if (ensured.error) {
+    sendJson(response, 409, { error: ensured.error });
     return;
   }
 
@@ -1728,9 +1843,14 @@ async function handleWechatBind(request, response, instanceId) {
   const url = new URL(request.url || "", "http://localhost");
   const forceRegenerate = parseBooleanFlag(url.searchParams.get("force"), false);
 
-  const instance = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
+  const ensured = ensureInstanceDefaultModel(findOwnedInstance(user, instanceId));
+  const instance = ensured.instance;
   if (!instance) {
     sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+  if (ensured.error) {
+    sendJson(response, 409, { error: ensured.error });
     return;
   }
 
@@ -1743,6 +1863,11 @@ async function handleWechatBind(request, response, instanceId) {
   if (!runtimeState.running) {
     sendJson(response, 409, { error: "请先启动该用户的 OpenClaw 容器，再进行微信绑定。" });
     return;
+  }
+
+  if (ensured.changed) {
+    writeInstanceFiles(dataDir, instance);
+    await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
   }
 
   if (wechatJobs.has(instance.id) && !forceRegenerate) {
