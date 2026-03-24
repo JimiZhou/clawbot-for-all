@@ -13,6 +13,10 @@ permissions:
   contents: write
   packages: write
 
+env:
+  RUNNER_OPENCLAW_VERSION: 2026.3.13
+  RUNNER_WECHAT_PLUGIN_SPEC: "@tencent-weixin/openclaw-weixin@1.0.3"
+
 jobs:
   build-images:
     name: Build ${{ matrix.label }}
@@ -50,9 +54,11 @@ jobs:
         shell: bash
         run: |
           if [ "${{ matrix.image_name }}" = "clawbot-openclaw-runner" ]; then
-            openclaw_version="$(npm view openclaw version)"
+            openclaw_version="${RUNNER_OPENCLAW_VERSION}"
             echo "openclaw_version=${openclaw_version}" >> "$GITHUB_OUTPUT"
-            echo "build_args=OPENCLAW_VERSION=${openclaw_version}" >> "$GITHUB_OUTPUT"
+            printf 'build_args<<EOF\nOPENCLAW_VERSION=%s\nOPENCLAW_WECHAT_PLUGIN_SPEC=%s\nEOF\n' \
+              "$openclaw_version" \
+              "$RUNNER_WECHAT_PLUGIN_SPEC" >> "$GITHUB_OUTPUT"
             printf 'extra_labels<<EOF\nio.clawbot.openclaw.version=%s\nEOF\n' "$openclaw_version" >> "$GITHUB_OUTPUT"
           else
             echo "openclaw_version=" >> "$GITHUB_OUTPUT"
