@@ -30,8 +30,10 @@ import {
   getRunnerImageStatus,
   getInstanceLogs,
   getInstanceStats,
+  inspectInstanceBindMounts,
   inspectInstance,
   refreshRunnerImage,
+  resolveHostBindPath,
   resolveInstanceProxyTarget,
   sendInteractiveInput,
   setRuntimeLogger,
@@ -250,6 +252,7 @@ logServer("info", "Server 初始化完成。", {
 void (async () => {
   await repairInstancesMissingModelInBackground();
   await repairInstanceConfigDriftInBackground();
+  await repairInstanceMountDriftInBackground();
 })();
 
 function resolveRequestHost(request) {
@@ -1000,6 +1003,40 @@ async function repairInstanceConfigDriftInBackground() {
       });
     } catch (error) {
       logServer("error", `自动修复实例配置漂移失败：${candidate.id}`, error);
+    }
+  }
+}
+
+async function repairInstanceMountDriftInBackground() {
+  const database = loadDatabase(dataDir);
+
+  for (const candidate of database.instances || []) {
+    try {
+      const runtimeState = await inspectInstance(candidate);
+      if (!runtimeState.running) {
+        continue;
+      }
+
+      const paths = getInstancePaths(dataDir, candidate.id);
+      const expectedHomeDir = await resolveHostBindPath(paths.homeDir);
+      const expectedWorkspaceDir = await resolveHostBindPath(paths.workspaceDir);
+      const actualMounts = await inspectInstanceBindMounts(candidate);
+
+      const homeMismatch = String(actualMounts["/var/lib/openclaw"] || "") !== expectedHomeDir;
+      const workspaceMismatch = String(actualMounts["/workspace"] || "") !== expectedWorkspaceDir;
+      if (!homeMismatch && !workspaceMismatch) {
+        continue;
+      }
+
+      await restartManagedInstance(candidate);
+      logServer("info", `已自动修复实例挂载漂移：${candidate.id}`, {
+        expectedHomeDir,
+        expectedWorkspaceDir,
+        actualHomeDir: actualMounts["/var/lib/openclaw"] || null,
+        actualWorkspaceDir: actualMounts["/workspace"] || null,
+      });
+    } catch (error) {
+      logServer("error", `自动修复实例挂载漂移失败：${candidate.id}`, error);
     }
   }
 }

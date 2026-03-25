@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import {
   nowIso,
   shellEscape,
@@ -35,6 +36,7 @@ let runnerImageTask = null;
 let runtimeLogger = null;
 let appDockerNetworkTask = null;
 let appDockerGatewayTask = null;
+let appDockerMountsTask = null;
 
 function tailSnippet(output, maxLength = 2000) {
   const text = String(output || "");
@@ -215,6 +217,104 @@ async function getAppDockerGateway() {
     appDockerGatewayTask = detectAppDockerGateway().catch(() => "");
   }
   return appDockerGatewayTask;
+}
+
+async function detectAppDockerMounts() {
+  if (!fs.existsSync("/.dockerenv")) {
+    return [];
+  }
+
+  const containerId = String(process.env.HOSTNAME || "").trim();
+  if (!containerId) {
+    return [];
+  }
+
+  const result = await runProcess("docker", [
+    "inspect",
+    "--format",
+    "{{json .Mounts}}",
+    containerId,
+  ], {
+    timeoutMs: 5_000,
+  });
+
+  if (result.timedOut || result.code !== 0) {
+    return [];
+  }
+
+  try {
+    const mounts = JSON.parse(String(result.stdout || "").trim());
+    return Array.isArray(mounts)
+      ? mounts
+        .map((mount) => ({
+          source: String(mount?.Source || "").trim(),
+          destination: String(mount?.Destination || "").trim(),
+        }))
+        .filter((mount) => mount.source && mount.destination)
+        .sort((left, right) => right.destination.length - left.destination.length)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function getAppDockerMounts() {
+  if (!appDockerMountsTask) {
+    appDockerMountsTask = detectAppDockerMounts().catch(() => []);
+  }
+  return appDockerMountsTask;
+}
+
+export async function resolveHostBindPath(containerPath) {
+  const normalizedContainerPath = path.resolve(String(containerPath || ""));
+  const mounts = await getAppDockerMounts();
+
+  for (const mount of mounts) {
+    const destination = path.resolve(mount.destination);
+    if (normalizedContainerPath !== destination && !normalizedContainerPath.startsWith(`${destination}${path.sep}`)) {
+      continue;
+    }
+
+    const relativePath = path.relative(destination, normalizedContainerPath);
+    return relativePath && relativePath !== "."
+      ? path.join(mount.source, relativePath)
+      : mount.source;
+  }
+
+  return normalizedContainerPath;
+}
+
+export async function inspectInstanceBindMounts(instance) {
+  const result = await runProcess("docker", [
+    "inspect",
+    "--format",
+    "{{json .Mounts}}",
+    instance.containerName,
+  ], {
+    timeoutMs: 5_000,
+  });
+
+  if (result.timedOut || result.code !== 0) {
+    return {};
+  }
+
+  try {
+    const mounts = JSON.parse(String(result.stdout || "").trim());
+    if (!Array.isArray(mounts)) {
+      return {};
+    }
+
+    return Object.fromEntries(
+      mounts
+        .map((mount) => [
+          String(mount?.Destination || "").trim(),
+          String(mount?.Source || "").trim(),
+        ])
+        .filter(([destination, source]) => destination && source),
+    );
+  } catch {
+    return {};
+  }
 }
 
 function patchRunnerImageState(patch = {}) {
@@ -511,6 +611,8 @@ export async function startInstance(projectRoot, paths, instance) {
 
   const resourceArgs = buildRunnerResourceArgs();
   const sharedDockerNetwork = await getAppDockerNetwork();
+  const hostHomeDir = await resolveHostBindPath(paths.homeDir);
+  const hostWorkspaceDir = await resolveHostBindPath(paths.workspaceDir);
   const networkArgs = sharedDockerNetwork
     ? ["--network", sharedDockerNetwork, "--network-alias", instance.containerName]
     : [];
@@ -531,9 +633,9 @@ export async function startInstance(projectRoot, paths, instance) {
     "-e",
     "OPENCLAW_CONFIG_PATH=/var/lib/openclaw/openclaw.json",
     "-v",
-    `${paths.homeDir}:/var/lib/openclaw`,
+    `${hostHomeDir}:/var/lib/openclaw`,
     "-v",
-    `${paths.workspaceDir}:/workspace`,
+    `${hostWorkspaceDir}:/workspace`,
     RUNNER_IMAGE,
   ], {
     timeoutMs: 60 * 1000,
@@ -546,6 +648,8 @@ export async function startInstance(projectRoot, paths, instance) {
   logRuntime("info", `实例容器已启动：${instance.containerName}`, {
     port: instance.port,
     sharedDockerNetwork: sharedDockerNetwork || null,
+    hostHomeDir,
+    hostWorkspaceDir,
     cpus: RUNNER_CPUS || null,
     memory: RUNNER_MEMORY || null,
     image: RUNNER_IMAGE,
