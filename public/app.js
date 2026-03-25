@@ -842,7 +842,7 @@ function instanceTone(instance) {
 
 function bindingTone(binding) {
   if (!binding) return "muted";
-  if (binding.status === "connected") return "good";
+  if (binding.status === "connected" || (binding.pairedAccounts || []).length > 0) return "good";
   if (binding.status === "error") return "danger";
   if (["starting", "waiting_scan", "scanned"].includes(binding.status)) return "accent";
   return "muted";
@@ -1586,8 +1586,9 @@ function bindingContent(inst, binding, pairedAccounts) {
   const primaryLabel = hasGeneratedBefore ? "重新生成二维码" : "生成配对二维码";
   const busyBind = state.busyKey === `wechat:${inst.id}` || state.busyKey === `wechat-rebind:${inst.id}`;
   const busyUnbind = state.busyKey === `wechat-unbind:${inst.id}`;
+  const bindingConnected = binding.status === "connected" || pairedAccounts.length > 0;
 
-  if (binding.status === "connected") {
+  if (bindingConnected) {
     return `
       <p class="text-muted" style="margin-bottom:12px">微信已绑定成功，二维码区域已隐藏。</p>
       <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">

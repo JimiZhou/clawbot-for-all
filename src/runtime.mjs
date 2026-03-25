@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import {
   nowIso,
   shellEscape,
@@ -32,6 +33,8 @@ const runnerImageState = {
 
 let runnerImageTask = null;
 let runtimeLogger = null;
+let appDockerNetworkTask = null;
+let appDockerGatewayTask = null;
 
 function tailSnippet(output, maxLength = 2000) {
   const text = String(output || "");
@@ -126,6 +129,92 @@ function buildRunnerResourceArgs() {
   }
 
   return args;
+}
+
+async function detectAppDockerNetwork() {
+  const explicitNetwork = String(process.env.CLAWBOT_DOCKER_NETWORK || "").trim();
+  if (explicitNetwork) {
+    return explicitNetwork;
+  }
+
+  if (!fs.existsSync("/.dockerenv")) {
+    return "";
+  }
+
+  const containerId = String(process.env.HOSTNAME || "").trim();
+  if (!containerId) {
+    return "";
+  }
+
+  const result = await runProcess("docker", [
+    "inspect",
+    "--format",
+    "{{json .NetworkSettings.Networks}}",
+    containerId,
+  ], {
+    timeoutMs: 5_000,
+  });
+
+  if (result.timedOut || result.code !== 0) {
+    return "";
+  }
+
+  try {
+    const networks = JSON.parse(String(result.stdout || "").trim());
+    return Object.keys(networks || {}).filter(Boolean)[0] || "";
+  } catch {
+    return "";
+  }
+}
+
+async function getAppDockerNetwork() {
+  if (!appDockerNetworkTask) {
+    appDockerNetworkTask = detectAppDockerNetwork().catch(() => "");
+  }
+  return appDockerNetworkTask;
+}
+
+async function detectAppDockerGateway() {
+  if (!fs.existsSync("/.dockerenv")) {
+    return "";
+  }
+
+  const containerId = String(process.env.HOSTNAME || "").trim();
+  if (!containerId) {
+    return "";
+  }
+
+  const networkName = await getAppDockerNetwork();
+  if (!networkName) {
+    return "";
+  }
+
+  const result = await runProcess("docker", [
+    "inspect",
+    "--format",
+    "{{json .NetworkSettings.Networks}}",
+    containerId,
+  ], {
+    timeoutMs: 5_000,
+  });
+
+  if (result.timedOut || result.code !== 0) {
+    return "";
+  }
+
+  try {
+    const networks = JSON.parse(String(result.stdout || "").trim());
+    return String(networks?.[networkName]?.Gateway || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function getAppDockerGateway() {
+  if (!appDockerGatewayTask) {
+    appDockerGatewayTask = detectAppDockerGateway().catch(() => "");
+  }
+  return appDockerGatewayTask;
 }
 
 function patchRunnerImageState(patch = {}) {
@@ -369,11 +458,62 @@ export async function inspectInstance(instance) {
   };
 }
 
+export async function resolveInstanceProxyTarget(instance) {
+  const sharedDockerNetwork = await getAppDockerNetwork();
+  if (sharedDockerNetwork) {
+    const result = await runProcess("docker", [
+      "inspect",
+      "--format",
+      "{{json .NetworkSettings.Networks}}",
+      instance.containerName,
+    ], {
+      timeoutMs: 5_000,
+    });
+
+    if (!result.timedOut && result.code === 0) {
+      try {
+        const networks = JSON.parse(String(result.stdout || "").trim());
+        const selectedNetwork = networks?.[sharedDockerNetwork];
+        const ipAddress = String(selectedNetwork?.IPAddress || "").trim();
+        if (ipAddress) {
+          return {
+            host: ipAddress,
+            port: 18789,
+            mode: "container-network",
+            network: sharedDockerNetwork,
+          };
+        }
+      } catch {}
+    }
+  }
+
+  const hostGateway = await getAppDockerGateway();
+  if (hostGateway) {
+    return {
+      host: hostGateway,
+      port: instance.port,
+      mode: "host-gateway",
+      network: sharedDockerNetwork || "",
+    };
+  }
+
+  return {
+    host: "127.0.0.1",
+    port: instance.port,
+    mode: "published-port",
+    network: "",
+  };
+}
+
 export async function startInstance(projectRoot, paths, instance) {
   await ensureRunnerImage();
   await stopInstance(instance);
 
   const resourceArgs = buildRunnerResourceArgs();
+  const sharedDockerNetwork = await getAppDockerNetwork();
+  const networkArgs = sharedDockerNetwork
+    ? ["--network", sharedDockerNetwork, "--network-alias", instance.containerName]
+    : [];
 
   const result = await runProcess("docker", [
     "run",
@@ -383,6 +523,7 @@ export async function startInstance(projectRoot, paths, instance) {
     "--restart",
     "unless-stopped",
     ...resourceArgs,
+    ...networkArgs,
     "-p",
     `${instance.port}:18789`,
     "-e",
@@ -404,6 +545,7 @@ export async function startInstance(projectRoot, paths, instance) {
 
   logRuntime("info", `实例容器已启动：${instance.containerName}`, {
     port: instance.port,
+    sharedDockerNetwork: sharedDockerNetwork || null,
     cpus: RUNNER_CPUS || null,
     memory: RUNNER_MEMORY || null,
     image: RUNNER_IMAGE,

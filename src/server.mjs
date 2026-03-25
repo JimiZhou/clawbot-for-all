@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { hashPassword, verifyPassword } from "./auth.mjs";
 import {
+  buildOpenClawConfig,
   createInstanceRecord,
   getInstancePaths,
   INSTANCE_BASE_PORT,
@@ -31,6 +32,7 @@ import {
   getInstanceStats,
   inspectInstance,
   refreshRunnerImage,
+  resolveInstanceProxyTarget,
   sendInteractiveInput,
   setRuntimeLogger,
   startInstance,
@@ -245,7 +247,10 @@ logServer("info", "Server 初始化完成。", {
   dataDir,
   serverLogPath: getServerLogPath(),
 });
-void repairInstancesMissingModelInBackground();
+void (async () => {
+  await repairInstancesMissingModelInBackground();
+  await repairInstanceConfigDriftInBackground();
+})();
 
 function resolveRequestHost(request) {
   return request.headers["x-forwarded-host"] || request.headers.host || "";
@@ -614,6 +619,17 @@ function readInstanceOpenClawConfig(instanceId) {
   return readJsonFile(path.join(homeDir, "openclaw.json"), null);
 }
 
+function hasInstanceConfigDrift(instance) {
+  if (!instance) {
+    return false;
+  }
+
+  syncInstanceModelChainShape(instance);
+  const current = readInstanceOpenClawConfig(instance.id);
+  const expected = buildOpenClawConfig(instance);
+  return JSON.stringify(current || null) !== JSON.stringify(expected);
+}
+
 function syncInstanceModelProviderConfig(instanceId) {
   mutateDatabase(dataDir, (draft) => {
     const target = draft.instances.find((record) => record.id === instanceId);
@@ -958,6 +974,32 @@ async function repairInstancesMissingModelInBackground() {
       });
     } catch (error) {
       logServer("error", `自动修复空模型实例失败：${candidate.id}`, error);
+    }
+  }
+}
+
+async function repairInstanceConfigDriftInBackground() {
+  const database = loadDatabase(dataDir);
+  const candidates = (database.instances || []).filter((instance) => hasInstanceConfigDrift(instance));
+
+  if (!candidates.length) {
+    return;
+  }
+
+  for (const candidate of candidates) {
+    try {
+      writeInstanceFiles(dataDir, candidate);
+      const runtimeState = await inspectInstance(candidate);
+      if (runtimeState.running) {
+        await restartManagedInstance(candidate);
+      }
+
+      logServer("info", `已自动修复实例配置漂移：${candidate.id}`, {
+        runtimeStatus: runtimeState.status,
+        primaryModel: candidate.model ? `${candidate.model.providerId}/${candidate.model.modelId}` : null,
+      });
+    } catch (error) {
+      logServer("error", `自动修复实例配置漂移失败：${candidate.id}`, error);
     }
   }
 }
@@ -2256,8 +2298,8 @@ function findInstanceForProxy(user, instanceId) {
   return null;
 }
 
-function proxyRequest(request, response, instance, subPath, queryString) {
-  const targetPort = instance.port;
+async function proxyRequest(request, response, instance, subPath, queryString) {
+  const target = await resolveInstanceProxyTarget(instance);
   const targetPath = `/${subPath}${queryString ? `?${queryString}` : ""}`;
 
   const headers = { ...request.headers };
@@ -2273,8 +2315,8 @@ function proxyRequest(request, response, instance, subPath, queryString) {
 
   const proxyReq = http.request(
     {
-      hostname: "127.0.0.1",
-      port: targetPort,
+      hostname: target.host,
+      port: target.port,
       path: targetPath,
       method: request.method,
       headers,
@@ -2784,7 +2826,7 @@ const server = http.createServer(async (request, response) => {
       }
 
       const subPath = (rest || "/").slice(1);
-      proxyRequest(request, response, instance, subPath, url.search.slice(1));
+      await proxyRequest(request, response, instance, subPath, url.search.slice(1));
       return;
     }
 
@@ -2824,37 +2866,43 @@ server.on("upgrade", (request, socket, head) => {
     const subPath = (rest || "/").slice(1);
     const targetPath = `/${subPath}${url.search}`;
 
-    const target = net.connect(instance.port, "127.0.0.1", () => {
-      const headers = { ...request.headers };
-      delete headers.cookie;
-      headers.host = request.headers.host || `127.0.0.1:${instance.port}`;
-      headers["x-forwarded-host"] = request.headers.host || headers.host;
-      if (!headers["x-forwarded-proto"]) {
-        headers["x-forwarded-proto"] = request.socket.encrypted ? "https" : "http";
-      }
-      headers.authorization = `Bearer ${instance.gatewayToken}`;
+    void (async () => {
+      const proxyTarget = await resolveInstanceProxyTarget(instance);
+      const target = net.connect(proxyTarget.port, proxyTarget.host, () => {
+        const headers = { ...request.headers };
+        delete headers.cookie;
+        headers.host = request.headers.host || `${proxyTarget.host}:${proxyTarget.port}`;
+        headers["x-forwarded-host"] = request.headers.host || headers.host;
+        if (!headers["x-forwarded-proto"]) {
+          headers["x-forwarded-proto"] = request.socket.encrypted ? "https" : "http";
+        }
+        headers.authorization = `Bearer ${instance.gatewayToken}`;
 
-      let rawHeader = `${request.method} ${targetPath} HTTP/1.1\r\n`;
-      for (const [key, value] of Object.entries(headers)) {
-        rawHeader += `${key}: ${value}\r\n`;
-      }
-      rawHeader += "\r\n";
+        let rawHeader = `${request.method} ${targetPath} HTTP/1.1\r\n`;
+        for (const [key, value] of Object.entries(headers)) {
+          rawHeader += `${key}: ${value}\r\n`;
+        }
+        rawHeader += "\r\n";
 
-      target.write(rawHeader);
-      if (head.length > 0) {
-        target.write(head);
-      }
-      socket.pipe(target);
-      target.pipe(socket);
-    });
+        target.write(rawHeader);
+        if (head.length > 0) {
+          target.write(head);
+        }
+        socket.pipe(target);
+        target.pipe(socket);
+      });
 
-    target.on("error", (error) => {
-      logServer("error", `WebSocket 代理连接失败：${proxyInstanceId}`, error);
+      target.on("error", (error) => {
+        logServer("error", `WebSocket 代理连接失败：${proxyInstanceId}`, error);
+        socket.destroy();
+      });
+
+      socket.on("error", () => {
+        target.destroy();
+      });
+    })().catch((error) => {
+      logServer("error", `WebSocket 代理目标解析失败：${proxyInstanceId}`, error);
       socket.destroy();
-    });
-
-    socket.on("error", () => {
-      target.destroy();
     });
   } catch (error) {
     logServer("error", "WebSocket upgrade 处理失败", error);
