@@ -57,6 +57,7 @@ import {
   sanitizeName,
   sendJson,
   setCookieHeader,
+  shellEscape,
   trimTo,
 } from "./utils.mjs";
 
@@ -361,6 +362,23 @@ function readWechatPairedAccounts(instance) {
       };
     })
     .filter((record) => record.accountId);
+}
+
+function getWechatStateDir(instance) {
+  const { homeDir } = getInstancePaths(dataDir, instance.id);
+  return path.join(homeDir, ".openclaw", "openclaw-weixin");
+}
+
+function createIdleWechatBinding(message = "") {
+  return {
+    status: "idle",
+    updatedAt: message ? nowIso() : null,
+    qrMode: null,
+    qrPayload: "",
+    qrLink: "",
+    outputSnippet: message,
+    pairedAccounts: [],
+  };
 }
 
 function mergeWechatPairedAccounts(instance) {
@@ -753,6 +771,29 @@ async function startInstanceWithPortRecovery(instance) {
   throw lastError;
 }
 
+async function restartManagedInstance(instance) {
+  writeInstanceFiles(dataDir, instance);
+  await stopInstance(instance);
+  await startInstanceWithPortRecovery(instance);
+  instance.status = "running";
+  instance.updatedAt = nowIso();
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+    Object.assign(target, {
+      port: instance.port,
+      dashboardUrl: instance.dashboardUrl,
+      status: instance.status,
+      updatedAt: instance.updatedAt,
+    });
+  });
+
+  return instance;
+}
+
 async function ensureInstanceRunning(instance) {
   writeInstanceFiles(dataDir, instance);
   const runtimeState = await inspectInstance(instance);
@@ -908,7 +949,7 @@ async function repairInstancesMissingModelInBackground() {
       writeInstanceFiles(dataDir, candidate);
       const runtimeState = await inspectInstance(candidate);
       if (runtimeState.running) {
-        await execInstanceShell(candidate, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+        await restartManagedInstance(candidate);
       }
 
       logServer("info", `已自动修复空模型实例：${candidate.id}`, {
@@ -1702,7 +1743,7 @@ async function handleUpdatePlugins(request, response, instanceId) {
   const runtimeState = await inspectInstance(instance);
   instance.status = runtimeState.status;
   if (runtimeState.running) {
-    await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+    await restartManagedInstance(instance);
   }
 
   mutateDatabase(dataDir, (draft) => {
@@ -1813,7 +1854,8 @@ async function handleStartModelAuth(request, response, instanceId) {
       if (code === 0) {
         syncInstanceModelProviderConfig(instance.id);
         try {
-          await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+          const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
+          await restartManagedInstance(latest);
         } catch {}
         patchModelAuthState(instance.id, {
           status: "success",
@@ -2030,7 +2072,7 @@ async function handleRestartGateway(request, response, instanceId) {
   }
 
   writeInstanceFiles(dataDir, instance);
-  await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+  await restartManagedInstance(instance);
   const latest = await refreshInstanceRuntimeState(instance.id);
 
   sendJson(response, 200, {
@@ -2070,7 +2112,7 @@ async function handleWechatBind(request, response, instanceId) {
 
   if (ensured.changed) {
     writeInstanceFiles(dataDir, instance);
-    await execInstanceShell(instance, "openclaw gateway restart", { timeoutMs: 60 * 1000 });
+    await restartManagedInstance(instance);
   }
 
   if (wechatJobs.has(instance.id) && !forceRegenerate) {
@@ -2122,6 +2164,81 @@ async function handleWechatBind(request, response, instanceId) {
   const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
   sendJson(response, 202, {
     instance: publicInstanceForHost(latest, resolveRequestHost(request)),
+  });
+}
+
+async function handleWechatUnbind(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  const instance = findOwnedInstance(user, instanceId);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  const runningJob = wechatJobs.get(instance.id);
+  if (runningJob) {
+    runningJob.cancel?.();
+    wechatJobs.delete(instance.id);
+  }
+
+  const runtimeState = await inspectInstance(instance);
+  const pairedAccounts = readWechatPairedAccounts(instance);
+  const wechatStateDir = getWechatStateDir(instance);
+
+  if (runtimeState.running) {
+    for (const account of pairedAccounts) {
+      try {
+        await execInstanceShell(
+          instance,
+          `openclaw channels logout --channel openclaw-weixin --account ${shellEscape(account.accountId)}`,
+          { timeoutMs: 20 * 1000 },
+        );
+      } catch (error) {
+        logServer("warn", `微信账号登出失败，继续执行本地解绑：${instance.id}/${account.accountId}`, error);
+      }
+    }
+
+    try {
+      await execInstanceShell(instance, "rm -rf /var/lib/openclaw/.openclaw/openclaw-weixin", {
+        timeoutMs: 20 * 1000,
+      });
+    } catch (error) {
+      logServer("warn", `清理容器内微信状态目录失败：${instance.id}`, error);
+    }
+  }
+
+  try {
+    fs.rmSync(wechatStateDir, { recursive: true, force: true });
+  } catch (error) {
+    logServer("warn", `清理宿主机微信状态目录失败：${instance.id}`, error);
+  }
+
+  instance.wechatBinding = createIdleWechatBinding("当前微信配对已解除，可重新生成二维码。");
+  instance.updatedAt = nowIso();
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+
+    target.wechatBinding = createIdleWechatBinding("当前微信配对已解除，可重新生成二维码。");
+    target.updatedAt = instance.updatedAt;
+  });
+
+  if (runtimeState.running) {
+    await restartManagedInstance(instance);
+  } else {
+    instance.status = runtimeState.status;
+  }
+
+  const latest = await refreshInstanceRuntimeState(instance.id);
+  sendJson(response, 200, {
+    instance: publicInstanceForHost(latest || instance, resolveRequestHost(request)),
   });
 }
 
@@ -2301,7 +2418,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|logs|plugins|restart-gateway|stats|recreate)$/);
+    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|wechat-unbind|logs|plugins|restart-gateway|stats|recreate)$/);
     if (instanceMatch) {
       const [, instanceId, action] = instanceMatch;
 
@@ -2332,6 +2449,11 @@ const server = http.createServer(async (request, response) => {
 
       if (request.method === "POST" && action === "wechat-bind") {
         await handleWechatBind(request, response, instanceId);
+        return;
+      }
+
+      if (request.method === "POST" && action === "wechat-unbind") {
+        await handleWechatUnbind(request, response, instanceId);
         return;
       }
 

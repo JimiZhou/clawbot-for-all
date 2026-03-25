@@ -58,6 +58,7 @@ const state = {
   motionMarks: {},
   serverLogsSignature: "",
   statsSignaturesByInstanceId: {},
+  logScrollByKey: {},
 };
 
 const app = document.querySelector("#app");
@@ -164,6 +165,48 @@ function scheduleRender() {
 
 function hasMotion(name) {
   return Boolean(name) && Number(state.motionMarks[name] || 0) > Date.now();
+}
+
+function snapshotLogScrollNode(node) {
+  if (!(node instanceof HTMLElement)) {
+    return null;
+  }
+
+  const key = node.getAttribute("data-log-scroll-key");
+  if (!key) {
+    return null;
+  }
+
+  const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+  return {
+    key,
+    scrollTop: Math.max(0, node.scrollTop),
+    stickToBottom: maxScrollTop - node.scrollTop <= 24,
+  };
+}
+
+function captureLogScrollPositions() {
+  const next = { ...state.logScrollByKey };
+  document.querySelectorAll("[data-log-scroll-key]").forEach((node) => {
+    const snapshot = snapshotLogScrollNode(node);
+    if (!snapshot) return;
+    next[snapshot.key] = snapshot;
+  });
+  state.logScrollByKey = next;
+}
+
+function restoreLogScrollPositions() {
+  document.querySelectorAll("[data-log-scroll-key]").forEach((node) => {
+    if (!(node instanceof HTMLElement)) return;
+    const key = node.getAttribute("data-log-scroll-key");
+    if (!key) return;
+    const snapshot = state.logScrollByKey[key];
+    if (!snapshot) return;
+    const maxScrollTop = Math.max(0, node.scrollHeight - node.clientHeight);
+    node.scrollTop = snapshot.stickToBottom
+      ? maxScrollTop
+      : Math.min(maxScrollTop, Math.max(0, snapshot.scrollTop));
+  });
 }
 
 function currentSceneKey(route) {
@@ -1131,7 +1174,7 @@ function adminServerLogsTab() {
       </div>
 
       ${logs.text
-        ? `<pre class="${logPanelClass}">${escapeHtml(logs.text)}</pre>`
+        ? `<pre class="${logPanelClass}" data-log-scroll-key="server-logs">${escapeHtml(logs.text)}</pre>`
         : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">当前还没有 server 日志。</p>`
       }
     </div>`;
@@ -1541,10 +1584,16 @@ function bindingContent(inst, binding, pairedAccounts) {
   const visibleLog = bindingLogSnippet(binding);
   const hasGeneratedBefore = Boolean(binding.qrPayload || qrLink || visibleLog || binding.status === "error" || binding.status === "connected");
   const primaryLabel = hasGeneratedBefore ? "重新生成二维码" : "生成配对二维码";
+  const busyBind = state.busyKey === `wechat:${inst.id}` || state.busyKey === `wechat-rebind:${inst.id}`;
+  const busyUnbind = state.busyKey === `wechat-unbind:${inst.id}`;
 
   if (binding.status === "connected") {
     return `
       <p class="text-muted" style="margin-bottom:12px">微信已绑定成功，二维码区域已隐藏。</p>
+      <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
+        <button class="btn btn-secondary btn-sm" data-action="wechat-reset-bind" data-instance-id="${inst.id}">${busyBind ? "处理中..." : "重新二维码配对"}</button>
+        <button class="btn btn-danger btn-sm" data-action="wechat-unbind" data-instance-id="${inst.id}">${busyUnbind ? "解绑中..." : "解除当前配对"}</button>
+      </div>
       ${pairedAccounts.length
         ? `
           <h4 class="sub-title">已配对账号 (${pairedAccounts.length})</h4>
@@ -1570,7 +1619,7 @@ function bindingContent(inst, binding, pairedAccounts) {
 
   return `
     <div class="form-actions" style="justify-content:flex-start;margin-bottom:8px">
-      <button class="btn ${bindingActive ? "btn-secondary" : "btn-primary"} btn-sm" data-action="${bindingActive ? "wechat-rebind" : "wechat-bind"}" data-instance-id="${inst.id}">${state.busyKey === `wechat:${inst.id}` ? "生成中..." : primaryLabel}</button>
+      <button class="btn ${bindingActive ? "btn-secondary" : "btn-primary"} btn-sm" data-action="${bindingActive ? "wechat-rebind" : "wechat-bind"}" data-instance-id="${inst.id}">${busyBind ? "生成中..." : primaryLabel}</button>
       ${qrLink ? `<a class="btn btn-ghost btn-sm" href="${qrLink}" target="_blank" rel="noreferrer">打开微信扫码页</a>` : ""}
     </div>
     ${qrMarkup(binding, qrImageSrc, qrLink)}
@@ -1706,7 +1755,7 @@ function instanceConfigTab(inst) {
           <button class="btn btn-ghost btn-sm" type="submit">${state.busyKey === `logs:${inst.id}` ? "刷新中..." : "刷新日志"}</button>
         </form>
       </div>
-      ${logs ? `<pre class="${logPanelClass}">${escapeHtml(logs)}</pre>` : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">点击刷新查看容器日志。</p>`}
+      ${logs ? `<pre class="${logPanelClass}" data-log-scroll-key="instance-log:${inst.id}">${escapeHtml(logs)}</pre>` : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">点击刷新查看容器日志。</p>`}
     </div>`;
 }
 
@@ -1737,6 +1786,7 @@ function qrMarkup(binding, qrImageSrc, qrLink) {
 /* ── Render ───────────────────────────────────────────── */
 
 function renderNow() {
+  captureLogScrollPositions();
   const route = currentRoute();
   const motion = consumeSceneMotion(route);
   let html = flashMarkup();
@@ -1758,6 +1808,7 @@ function renderNow() {
 
   html += `<div class="scene-shell ${motion.animate ? "scene-enter" : ""}" data-scene="${escapeHtml(motion.sceneKey)}">${viewHtml}</div>`;
   app.innerHTML = html;
+  restoreLogScrollPositions();
 }
 
 function render() {
@@ -1983,6 +2034,13 @@ document.addEventListener("input", (event) => {
     syncAdminPresetDraftFromForm(presetForm);
   }
 });
+
+document.addEventListener("scroll", (event) => {
+  const target = event.target;
+  const snapshot = snapshotLogScrollNode(target);
+  if (!snapshot) return;
+  state.logScrollByKey[snapshot.key] = snapshot;
+}, true);
 
 /* ── Event: click actions ─────────────────────────────── */
 
@@ -2380,10 +2438,27 @@ document.addEventListener("click", async (event) => {
     }
 
     if (action === "wechat-rebind" && instanceId) {
-      setBusy(`wechat:${instanceId}`);
+      setBusy(`wechat-rebind:${instanceId}`);
       await requestJson(`/api/instances/${instanceId}/wechat-bind?force=1`, { method: "POST" });
       await loadInstances();
       setFlash("已重新生成微信绑定二维码。");
+      return;
+    }
+
+    if (action === "wechat-unbind" && instanceId) {
+      setBusy(`wechat-unbind:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/wechat-unbind`, { method: "POST" });
+      await loadInstances();
+      setFlash("当前微信配对已解除。");
+      return;
+    }
+
+    if (action === "wechat-reset-bind" && instanceId) {
+      setBusy(`wechat-rebind:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/wechat-unbind`, { method: "POST" });
+      await requestJson(`/api/instances/${instanceId}/wechat-bind?force=1`, { method: "POST" });
+      await loadInstances();
+      setFlash("已解除旧配对并重新生成二维码。");
       return;
     }
 

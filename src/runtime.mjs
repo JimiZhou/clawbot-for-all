@@ -512,7 +512,6 @@ if [ ! -d "$PLUGIN_DIR" ]; then
 fi
 openclaw config set plugins.entries.${WECHAT_CHANNEL_ID}.enabled true
 openclaw channels login --channel ${WECHAT_CHANNEL_ID} --verbose
-openclaw gateway restart
 `.trim();
 }
 

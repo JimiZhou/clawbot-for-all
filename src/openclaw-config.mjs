@@ -118,6 +118,7 @@ export function buildOpenClawConfig(instance) {
   const normalizedModel = modelChain[0] || null;
   const config = {
     gateway: {
+      mode: "local",
       bind: "lan",
       port: 18789,
       auth: {
