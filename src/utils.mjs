@@ -244,7 +244,7 @@ export function publicInstanceForHost(instance, requestHost) {
       needsInput: false,
     },
     plugins: withWechatPluginEnabled(instance.plugins),
-    wechatBinding: instance.wechatBinding || {
+    wechatBinding: {
       status: "idle",
       updatedAt: null,
       qrMode: null,
@@ -252,6 +252,11 @@ export function publicInstanceForHost(instance, requestHost) {
       qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
+      runtimeReady: false,
+      runtimeStatus: "idle",
+      runtimeMessage: "",
+      runtimeUpdatedAt: null,
+      ...(instance.wechatBinding || {}),
     },
   };
 }

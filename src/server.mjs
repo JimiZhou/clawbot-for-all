@@ -89,6 +89,7 @@ setRuntimeLogger(logServer);
 const wechatJobs = new Map();
 const provisioningJobs = new Map();
 const modelAuthJobs = new Map();
+const WECHAT_RUNTIME_INIT_MESSAGE = "Clawbot正在初始化，首次加载需要较长时间，请等待。";
 
 function validatePassword(password) {
   return String(password || "").length >= 8;
@@ -377,8 +378,31 @@ function getWechatStateDir(instance) {
   return path.join(homeDir, ".openclaw", "openclaw-weixin");
 }
 
-function createIdleWechatBinding(message = "") {
+function hasConnectedWechatBinding(binding = {}) {
+  return binding.status === "connected" || (binding.pairedAccounts || []).length > 0;
+}
+
+function withWechatRuntimeDefaults(binding = {}) {
+  const connected = hasConnectedWechatBinding(binding);
+  const runtimeReady = Boolean(binding.runtimeReady);
+  const runtimeStatus = connected
+    ? (runtimeReady ? "ready" : (binding.runtimeStatus || "initializing"))
+    : "idle";
+  const runtimeMessage = connected && !runtimeReady
+    ? (binding.runtimeMessage || WECHAT_RUNTIME_INIT_MESSAGE)
+    : "";
+
   return {
+    ...binding,
+    runtimeReady: connected ? runtimeReady : false,
+    runtimeStatus,
+    runtimeMessage,
+    runtimeUpdatedAt: binding.runtimeUpdatedAt || (connected ? nowIso() : null),
+  };
+}
+
+function createIdleWechatBinding(message = "") {
+  return withWechatRuntimeDefaults({
     status: "idle",
     updatedAt: message ? nowIso() : null,
     qrMode: null,
@@ -386,13 +410,13 @@ function createIdleWechatBinding(message = "") {
     qrLink: "",
     outputSnippet: message,
     pairedAccounts: [],
-  };
+  });
 }
 
 function mergeWechatPairedAccounts(instance) {
   const pairedAccounts = readWechatPairedAccounts(instance);
   const binding = instance.wechatBinding || {};
-  instance.wechatBinding = {
+  instance.wechatBinding = withWechatRuntimeDefaults({
     status: pairedAccounts.length && binding.status !== "error" ? "connected" : binding.status || "idle",
     updatedAt: binding.updatedAt || (pairedAccounts.length ? nowIso() : null),
     qrMode: binding.qrMode || null,
@@ -400,7 +424,73 @@ function mergeWechatPairedAccounts(instance) {
     qrLink: binding.qrLink || "",
     outputSnippet: binding.outputSnippet || "",
     pairedAccounts,
+    runtimeReady: binding.runtimeReady,
+    runtimeStatus: binding.runtimeStatus,
+    runtimeMessage: binding.runtimeMessage,
+    runtimeUpdatedAt: binding.runtimeUpdatedAt,
+  });
+  return instance;
+}
+
+function inferWechatRuntimeBootstrapState(logText) {
+  const text = String(logText || "").toLowerCase();
+  const readyMarkers = [
+    "device pairing auto-approved",
+    "role=operator",
+  ];
+  const blockingMarkers = [
+    "waiting for connection result",
+    "device-required",
+    "closed before connect",
+    "gateway service disabled",
+    "start with: openclaw gateway",
+  ];
+
+  const latestIndex = (markers) => markers.reduce((max, marker) => Math.max(max, text.lastIndexOf(marker)), -1);
+  const latestReady = latestIndex(readyMarkers);
+  const latestBlocking = latestIndex(blockingMarkers);
+
+  if (latestReady !== -1 && latestReady > latestBlocking) {
+    return {
+      runtimeReady: true,
+      runtimeStatus: "ready",
+      runtimeMessage: "",
+      runtimeUpdatedAt: nowIso(),
+    };
+  }
+
+  return {
+    runtimeReady: false,
+    runtimeStatus: "initializing",
+    runtimeMessage: WECHAT_RUNTIME_INIT_MESSAGE,
+    runtimeUpdatedAt: nowIso(),
   };
+}
+
+async function refreshWechatRuntimeBootstrapState(instance, runtimeState) {
+  const binding = withWechatRuntimeDefaults(instance.wechatBinding || {});
+  if (!runtimeState?.running || !hasConnectedWechatBinding(binding)) {
+    instance.wechatBinding = withWechatRuntimeDefaults(binding);
+    return instance;
+  }
+
+  try {
+    const logs = await getInstanceLogs(instance, 240);
+    instance.wechatBinding = withWechatRuntimeDefaults({
+      ...binding,
+      ...inferWechatRuntimeBootstrapState(logs),
+    });
+  } catch (error) {
+    logServer("warn", `读取实例日志判断微信运行态失败：${instance.id}`, error);
+    instance.wechatBinding = withWechatRuntimeDefaults({
+      ...binding,
+      runtimeReady: false,
+      runtimeStatus: "initializing",
+      runtimeMessage: WECHAT_RUNTIME_INIT_MESSAGE,
+      runtimeUpdatedAt: nowIso(),
+    });
+  }
+
   return instance;
 }
 
@@ -414,6 +504,7 @@ async function refreshInstanceRuntimeState(instanceId) {
   const runtimeState = await inspectInstance(instance);
   instance.status = runtimeState.status;
   mergeWechatPairedAccounts(instance);
+  await refreshWechatRuntimeBootstrapState(instance, runtimeState);
   instance.updatedAt = nowIso();
 
   mutateDatabase(dataDir, (draft) => {
@@ -548,7 +639,7 @@ function patchWechatState(instanceId, patch) {
       ...patch,
     };
 
-    target.wechatBinding = merged;
+    target.wechatBinding = withWechatRuntimeDefaults(merged);
     mergeWechatPairedAccounts(target);
     target.updatedAt = nowIso();
   });

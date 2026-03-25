@@ -49,7 +49,7 @@ function normalizeInstance(instance) {
       promptLabel: "",
       needsInput: false,
     },
-    wechatBinding: instance.wechatBinding || {
+    wechatBinding: {
       status: "idle",
       updatedAt: null,
       qrMode: null,
@@ -57,6 +57,11 @@ function normalizeInstance(instance) {
       qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
+      runtimeReady: false,
+      runtimeStatus: "idle",
+      runtimeMessage: "",
+      runtimeUpdatedAt: null,
+      ...(instance.wechatBinding || {}),
     },
   };
 }

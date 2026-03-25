@@ -586,6 +586,7 @@ function updatePolling() {
       (i) =>
         i.provisioning?.status === "running" ||
         ["starting", "waiting_scan", "scanned"].includes(i.wechatBinding?.status) ||
+        ((i.wechatBinding?.status === "connected" || (i.wechatBinding?.pairedAccounts || []).length > 0) && i.wechatBinding?.runtimeStatus === "initializing") ||
         ["starting", "running", "waiting_input"].includes(i.modelAuth?.status),
     );
 
@@ -1566,6 +1567,7 @@ function instanceRunTab(inst) {
       </div>
     </div>
 
+    ${instanceAccessCard(inst)}
     ${instanceStatsCard(inst)}
 
     <div class="card">
@@ -1574,6 +1576,36 @@ function instanceRunTab(inst) {
         ${statusBadge(binding.status || "idle", bindingTone(binding))}
       </div>
       ${bindingContent(inst, binding, pairedAccounts)}
+    </div>
+
+    ${instanceLogsCard(inst)}`;
+}
+
+function instanceAccessCard(inst) {
+  const encodedDashboardUrl = encodeURIComponent(inst.dashboardUrl || "");
+  const encodedGatewayToken = encodeURIComponent(inst.gatewayToken || "");
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">Control UI 访问</h3>
+        <span class="text-muted">代理入口与鉴权凭据</span>
+      </div>
+      <div class="access-panel">
+        <div class="access-item">
+          <span class="access-label">访问地址</span>
+          <code class="access-secret">${escapeHtml(inst.dashboardUrl || "—")}</code>
+        </div>
+        <div class="access-item">
+          <span class="access-label">访问 Token</span>
+          <code class="access-secret">${escapeHtml(inst.gatewayToken || "—")}</code>
+        </div>
+      </div>
+      <div class="form-actions" style="justify-content:flex-start;margin-top:14px">
+        <a class="btn btn-secondary btn-sm" href="${inst.dashboardUrl}" target="_blank" rel="noreferrer">打开 Control UI</a>
+        <button class="btn btn-ghost btn-sm" data-action="copy-control-ui-url" data-copy-value="${escapeHtml(encodedDashboardUrl)}" type="button">复制地址</button>
+        <button class="btn btn-ghost btn-sm" data-action="copy-gateway-token" data-copy-value="${escapeHtml(encodedGatewayToken)}" type="button">复制 Token</button>
+      </div>
+      <p class="text-muted" style="margin-top:10px">如果你要直连 Gateway 或调试 Control UI，可直接复制这里的 token；通过当前平台里的“打开 Control UI”会自动走代理鉴权。</p>
     </div>`;
 }
 
@@ -1587,9 +1619,17 @@ function bindingContent(inst, binding, pairedAccounts) {
   const busyBind = state.busyKey === `wechat:${inst.id}` || state.busyKey === `wechat-rebind:${inst.id}`;
   const busyUnbind = state.busyKey === `wechat-unbind:${inst.id}`;
   const bindingConnected = binding.status === "connected" || pairedAccounts.length > 0;
+  const showRuntimeWarmup = bindingConnected && binding.runtimeStatus === "initializing" && !binding.runtimeReady;
+  const runtimeWarmupMarkup = showRuntimeWarmup
+    ? `<div class="runtime-wait-banner">
+        <strong>Clawbot正在初始化</strong>
+        <p>${escapeHtml(binding.runtimeMessage || "Clawbot正在初始化，首次加载需要较长时间，请等待。")}</p>
+      </div>`
+    : "";
 
   if (bindingConnected) {
     return `
+      ${runtimeWarmupMarkup}
       <p class="text-muted" style="margin-bottom:12px">微信已绑定成功，二维码区域已隐藏。</p>
       <div class="form-actions" style="justify-content:flex-start;margin-bottom:12px">
         <button class="btn btn-secondary btn-sm" data-action="wechat-reset-bind" data-instance-id="${inst.id}">${busyBind ? "处理中..." : "重新二维码配对"}</button>
@@ -1684,20 +1724,11 @@ function renderPresetPicker(inst, presets) {
 }
 
 function instanceConfigTab(inst) {
-  const logs = state.logsByInstanceId[inst.id];
-  const currentTail = state.logTailByInstanceId[inst.id] || 200;
   const presets = state.modelPresets || [];
   const draft = getModelDraft(inst);
   const selectedProvider = modelProviderByKey(draft.providerKey);
   const providerOptions = state.modelProviders || [];
   const fieldRows = chunkList(selectedProvider?.fields || [], 2);
-  const logRefreshing = state.busyKey === `logs:${inst.id}`;
-  const logFresh = hasMotion(`logs:${inst.id}`);
-  const logPanelClass = [
-    "log-output",
-    logRefreshing ? "log-output-refreshing" : "",
-    logFresh ? "log-output-fresh" : "",
-  ].filter(Boolean).join(" ");
 
   return `
     <div class="instance-header">
@@ -1744,19 +1775,37 @@ function instanceConfigTab(inst) {
         <label class="form-label">Plugins JSON<textarea class="form-input form-textarea" name="pluginsJson" spellcheck="false">${escapeHtml(JSON.stringify(inst.plugins || DEFAULT_PLUGIN_TEMPLATE, null, 2))}</textarea></label>
         <button class="btn btn-ghost btn-sm" type="submit">${state.busyKey === `plugins:${inst.id}` ? "保存中..." : "保存插件配置"}</button>
       </form>
-    </details>
+    </details>`;
+}
 
+function instanceLogsCard(inst) {
+  const logs = state.logsByInstanceId[inst.id];
+  const currentTail = state.logTailByInstanceId[inst.id] || 200;
+  const logRefreshing = state.busyKey === `logs:${inst.id}`;
+  const logFresh = hasMotion(`logs:${inst.id}`);
+  const logPanelClass = [
+    "log-output",
+    logRefreshing ? "log-output-refreshing" : "",
+    logFresh ? "log-output-fresh" : "",
+  ].filter(Boolean).join(" ");
+
+  return `
     <div class="card">
       <div class="card-header">
-        <h3 class="card-title">日志</h3>
+        <div>
+          <h3 class="card-title">实例日志</h3>
+          <p class="text-muted">日志仅在你手动刷新时更新，不会主动刷新打断当前浏览位置。</p>
+        </div>
         <form class="log-controls" data-form="load-logs" data-instance-id="${inst.id}">
           <select class="form-input form-input-sm" name="tail">
             ${LOG_TAIL_OPTIONS.map((v) => `<option value="${v}" ${currentTail === v ? "selected" : ""}>最近 ${v} 行</option>`).join("")}
           </select>
-          <button class="btn btn-ghost btn-sm" type="submit">${state.busyKey === `logs:${inst.id}` ? "刷新中..." : "刷新日志"}</button>
+          <button class="btn btn-ghost btn-sm" type="submit">${logRefreshing ? "刷新中..." : "手动刷新"}</button>
         </form>
       </div>
-      ${logs ? `<pre class="${logPanelClass}" data-log-scroll-key="instance-log:${inst.id}">${escapeHtml(logs)}</pre>` : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">点击刷新查看容器日志。</p>`}
+      ${logs
+        ? `<pre class="${logPanelClass}" data-log-scroll-key="instance-log:${inst.id}">${escapeHtml(logs)}</pre>`
+        : `<p class="empty-text ${logRefreshing ? "loading-panel-text" : ""}">日志区已就位，点击“手动刷新”查看最新容器输出。</p>`}
     </div>`;
 }
 
@@ -1788,6 +1837,7 @@ function qrMarkup(binding, qrImageSrc, qrLink) {
 
 function renderNow() {
   captureLogScrollPositions();
+  const viewportScrollTop = window.scrollY;
   const route = currentRoute();
   const motion = consumeSceneMotion(route);
   let html = flashMarkup();
@@ -1810,6 +1860,9 @@ function renderNow() {
   html += `<div class="scene-shell ${motion.animate ? "scene-enter" : ""}" data-scene="${escapeHtml(motion.sceneKey)}">${viewHtml}</div>`;
   app.innerHTML = html;
   restoreLogScrollPositions();
+  if (!motion.animate) {
+    window.scrollTo(0, viewportScrollTop);
+  }
 }
 
 function render() {
@@ -1955,7 +2008,6 @@ document.addEventListener("submit", async (event) => {
       setBusy(`logs:${instanceId}`);
       await loadLogs(instanceId, tail);
       markMotion(`logs:${instanceId}`);
-      setFlash("日志已刷新。");
       return;
     }
 
@@ -1964,7 +2016,6 @@ document.addEventListener("submit", async (event) => {
       setBusy("server-logs");
       await loadAdminServerLogs(tail);
       markMotion("server-logs");
-      setFlash("Server 日志已刷新。");
       return;
     }
   } catch (error) {
@@ -2354,6 +2405,13 @@ document.addEventListener("click", async (event) => {
       const encoded = actionEl.getAttribute("data-copy-value") || "";
       const text = decodeURIComponent(encoded);
       await copyText(text, action === "copy-invite-code" ? "邀请码已复制。" : "邀请链接已复制。");
+      return;
+    }
+
+    if (action === "copy-control-ui-url" || action === "copy-gateway-token") {
+      const encoded = actionEl.getAttribute("data-copy-value") || "";
+      const text = decodeURIComponent(encoded);
+      await copyText(text, action === "copy-gateway-token" ? "访问 Token 已复制。" : "Control UI 地址已复制。");
       return;
     }
 

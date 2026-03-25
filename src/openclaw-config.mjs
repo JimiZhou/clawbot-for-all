@@ -65,6 +65,10 @@ export function createInstanceRecord({ userId, name, model, nextIndex, port: ass
       qrLink: "",
       outputSnippet: "",
       pairedAccounts: [],
+      runtimeReady: false,
+      runtimeStatus: "idle",
+      runtimeMessage: "",
+      runtimeUpdatedAt: null,
     },
   };
 }
@@ -74,6 +78,30 @@ export function ensureInstanceLayout(paths) {
   ensureDir(paths.homeDir);
   ensureDir(paths.workspaceDir);
   ensureDir(paths.logsDir);
+}
+
+function formatMemoryDate(date) {
+  return date.toISOString().slice(0, 10);
+}
+
+function ensureWorkspaceMemoryScaffold(workspaceDir) {
+  const memoryDir = path.join(workspaceDir, "memory");
+  ensureDir(memoryDir);
+
+  const files = [
+    path.join(workspaceDir, "MEMORY.md"),
+    path.join(memoryDir, `${formatMemoryDate(new Date())}.md`),
+  ];
+
+  const yesterday = new Date();
+  yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+  files.push(path.join(memoryDir, `${formatMemoryDate(yesterday)}.md`));
+
+  for (const filePath of files) {
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, "", "utf8");
+    }
+  }
 }
 
 function mergeProviderConfigs(modelChain) {
@@ -183,6 +211,7 @@ export function buildOpenClawConfig(instance) {
 export function writeInstanceFiles(dataDir, instance) {
   const paths = getInstancePaths(dataDir, instance.id);
   ensureInstanceLayout(paths);
+  ensureWorkspaceMemoryScaffold(paths.workspaceDir);
 
   writeJsonFile(path.join(paths.homeDir, "openclaw.json"), buildOpenClawConfig(instance));
 
