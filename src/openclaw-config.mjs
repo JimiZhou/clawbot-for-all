@@ -17,10 +17,12 @@ export function getInstancePaths(dataDir, instanceId) {
   };
 }
 
-export function createInstanceRecord({ userId, name, model, nextIndex }) {
+export function createInstanceRecord({ userId, name, model, nextIndex, port: assignedPort = null }) {
   const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   const createdAt = nowIso();
-  const port = INSTANCE_BASE_PORT + nextIndex;
+  const port = Number.isInteger(assignedPort) && assignedPort > INSTANCE_BASE_PORT
+    ? assignedPort
+    : INSTANCE_BASE_PORT + nextIndex;
   const baseSlug = slugify(name);
   const normalizedModel = normalizeModelSelection(model);
   const modelChain = normalizeModelChain(normalizedModel ? [normalizedModel] : [], normalizedModel);

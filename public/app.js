@@ -1460,11 +1460,26 @@ function instanceView() {
 function instanceRunTab(inst) {
   const binding = inst.wechatBinding || {};
   const pairedAccounts = binding.pairedAccounts || [];
-  const ready = (inst.provisioning?.status || "ready") === "ready";
+  const provisioning = inst.provisioning || {};
+  const ready = (provisioning.status || "ready") === "ready";
   const running = inst.status === "running";
   const starting = state.busyKey === `start:${inst.id}`;
 
   if (!ready) {
+    if (provisioning.status === "error") {
+      return `
+        <div class="card">
+          <div class="card-header">
+            <h3 class="card-title">实例创建失败</h3>
+            ${statusBadge("error", "danger")}
+          </div>
+          <p class="empty-text" style="margin-bottom:12px">${escapeHtml(provisioning.message || "实例创建过程中出现错误。")}</p>
+          <div class="form-actions" style="justify-content:flex-start">
+            <button class="btn btn-primary" data-action="recreate-instance" data-instance-id="${inst.id}">${state.busyKey === `recreate:${inst.id}` ? "重试中..." : "重新创建实例"}</button>
+          </div>
+        </div>`;
+    }
+
     return `<div class="card"><p class="empty-text">实例正在创建中，请稍候...</p></div>`;
   }
 
@@ -1696,11 +1711,15 @@ function instanceConfigTab(inst) {
 }
 
 function provisioningBanner(inst, percent, provisioning) {
+  const failed = provisioning.status === "error";
   return `
-    <div class="provisioning-banner">
+    <div class="provisioning-banner ${failed ? "provisioning-banner-error" : ""}">
       <div class="provisioning-info">
-        <strong>实例创建中</strong>
+        <strong>${failed ? "实例创建失败" : "实例创建中"}</strong>
         <span>${escapeHtml(provisioning.message || "")}</span>
+      </div>
+      <div class="provisioning-actions">
+        ${failed ? `<button class="btn btn-primary btn-sm" data-action="recreate-instance" data-instance-id="${inst.id}">${state.busyKey === `recreate:${inst.id}` ? "重试中..." : "重新创建实例"}</button>` : ""}
       </div>
       <div class="progress-bar"><div class="progress-fill" style="width:${percent}%;"></div></div>
     </div>`;
@@ -2325,6 +2344,14 @@ document.addEventListener("click", async (event) => {
       await requestJson(`/api/instances/${instanceId}/start`, { method: "POST" });
       await loadInstances();
       setFlash("容器已启动。");
+      return;
+    }
+
+    if (action === "recreate-instance" && instanceId) {
+      setBusy(`recreate:${instanceId}`);
+      await requestJson(`/api/instances/${instanceId}/recreate`, { method: "POST" });
+      await loadInstances();
+      setFlash("实例已重新进入创建流程。");
       return;
     }
 

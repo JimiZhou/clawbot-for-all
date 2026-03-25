@@ -7,6 +7,7 @@ import { hashPassword, verifyPassword } from "./auth.mjs";
 import {
   createInstanceRecord,
   getInstancePaths,
+  INSTANCE_BASE_PORT,
   writeInstanceFiles,
 } from "./openclaw-config.mjs";
 import {
@@ -30,7 +31,6 @@ import {
   getInstanceStats,
   inspectInstance,
   refreshRunnerImage,
-  restartInstance,
   sendInteractiveInput,
   setRuntimeLogger,
   startInstance,
@@ -475,8 +475,7 @@ function startProvisioningJob(instanceId, instanceSnapshot = null) {
         return;
       }
 
-      const paths = getInstancePaths(dataDir, latestInstance.id);
-      const runtimeState = await startInstance(projectRoot, paths, latestInstance);
+      const runtimeState = await startInstanceWithPortRecovery(latestInstance);
 
       mutateDatabase(dataDir, (draft) => {
         const target = draft.instances.find((record) => record.id === instanceId);
@@ -626,6 +625,134 @@ function syncInstanceModelProviderConfig(instanceId) {
   });
 }
 
+function applyInstancePort(instance, portNumber) {
+  instance.port = portNumber;
+  instance.dashboardUrl = `http://127.0.0.1:${portNumber}/`;
+  instance.updatedAt = nowIso();
+  return instance;
+}
+
+function isInstancePortConflictError(error) {
+  const text = String(error?.message || error || "").toLowerCase();
+  return (
+    text.includes("failed to set up container networking")
+    || text.includes("external connectivity")
+    || text.includes("port is already allocated")
+    || text.includes("address already in use")
+    || text.includes("bind for 0.0.0.0:")
+  );
+}
+
+function isTcpPortAvailable(portNumber) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    const finalize = (available) => {
+      try {
+        probe.close(() => resolve(available));
+      } catch {
+        resolve(available);
+      }
+    };
+
+    probe.once("error", (error) => {
+      if (error?.code === "EADDRINUSE" || error?.code === "EACCES") {
+        resolve(false);
+        return;
+      }
+      resolve(false);
+    });
+
+    probe.once("listening", () => finalize(true));
+    probe.listen(portNumber, "0.0.0.0");
+  });
+}
+
+async function findAvailableInstancePort(database, { excludeInstanceId = "", startPort = INSTANCE_BASE_PORT + 1 } = {}) {
+  const normalizedStartPort = Math.max(INSTANCE_BASE_PORT + 1, Number(startPort) || (INSTANCE_BASE_PORT + 1));
+  const usedPorts = new Set(
+    (database.instances || [])
+      .filter((record) => record && record.id !== excludeInstanceId)
+      .map((record) => Number(record.port))
+      .filter((value) => Number.isInteger(value) && value > 0),
+  );
+
+  const tryPort = async (candidate) => {
+    if (usedPorts.has(candidate)) {
+      return null;
+    }
+    return (await isTcpPortAvailable(candidate)) ? candidate : null;
+  };
+
+  for (let candidate = normalizedStartPort; candidate < normalizedStartPort + 5000; candidate += 1) {
+    const available = await tryPort(candidate);
+    if (available) {
+      return available;
+    }
+  }
+
+  for (let candidate = INSTANCE_BASE_PORT + 1; candidate < normalizedStartPort; candidate += 1) {
+    const available = await tryPort(candidate);
+    if (available) {
+      return available;
+    }
+  }
+
+  throw new Error("未找到可用实例端口。请检查宿主机端口占用情况。");
+}
+
+async function reassignInstancePort(instance, startPort = INSTANCE_BASE_PORT + 1) {
+  const database = loadDatabase(dataDir);
+  const nextPort = await findAvailableInstancePort(database, {
+    excludeInstanceId: instance.id,
+    startPort,
+  });
+
+  if (nextPort === instance.port) {
+    return false;
+  }
+
+  applyInstancePort(instance, nextPort);
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+    applyInstancePort(target, nextPort);
+  });
+
+  return true;
+}
+
+async function startInstanceWithPortRecovery(instance) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const paths = writeInstanceFiles(dataDir, instance);
+      return await startInstance(projectRoot, paths, instance);
+    } catch (error) {
+      lastError = error;
+      if (attempt > 0 || !isInstancePortConflictError(error)) {
+        throw error;
+      }
+
+      const previousPort = instance.port;
+      const reassigned = await reassignInstancePort(instance, previousPort + 1);
+      if (!reassigned) {
+        throw error;
+      }
+
+      logServer("warn", `实例端口冲突，已自动切换端口后重试：${instance.id}`, {
+        previousPort,
+        nextPort: instance.port,
+      });
+    }
+  }
+
+  throw lastError;
+}
+
 async function ensureInstanceRunning(instance) {
   writeInstanceFiles(dataDir, instance);
   const runtimeState = await inspectInstance(instance);
@@ -633,8 +760,7 @@ async function ensureInstanceRunning(instance) {
     return instance;
   }
 
-  const paths = writeInstanceFiles(dataDir, instance);
-  await startInstance(projectRoot, paths, instance);
+  await startInstanceWithPortRecovery(instance);
   instance.status = "running";
   instance.updatedAt = nowIso();
 
@@ -1150,12 +1276,14 @@ async function handleCreateInstance(request, response) {
   }
 
   const nextIndex = database.instances.length + 1;
-      const instance = createInstanceRecord({
-        userId: user.id,
-        name,
-        model,
-        nextIndex,
-      });
+  const assignedPort = await findAvailableInstancePort(database);
+  const instance = createInstanceRecord({
+    userId: user.id,
+    name,
+    model,
+    nextIndex,
+    port: assignedPort,
+  });
 
   mutateDatabase(dataDir, (draft) => {
     draft.instances.push(instance);
@@ -1167,6 +1295,82 @@ async function handleCreateInstance(request, response) {
     instanceName: instance.name,
     runnerImage: getRunnerImageStatus().image,
   });
+
+  sendJson(response, 202, {
+    instance: publicInstanceForHost(instance, resolveRequestHost(request)),
+  });
+}
+
+async function handleRecreateInstance(request, response, instanceId) {
+  const user = requireUser(request, response);
+  if (!user) {
+    return;
+  }
+
+  if (provisioningJobs.has(instanceId)) {
+    sendJson(response, 409, { error: "实例正在创建中，请稍后再试。" });
+    return;
+  }
+
+  const database = loadDatabase(dataDir);
+  const instance = database.instances.find((record) => record.id === instanceId && record.userId === user.id);
+  if (!instance) {
+    sendJson(response, 404, { error: "实例不存在。" });
+    return;
+  }
+
+  syncInstanceModelChainShape(instance);
+  if ((instance.provisioning?.status || "") !== "error") {
+    sendJson(response, 409, { error: "当前实例不处于创建失败状态，无需重新创建。" });
+    return;
+  }
+
+  await stopInstance(instance);
+
+  const nextPort = await findAvailableInstancePort(database, {
+    excludeInstanceId: instance.id,
+    startPort: Number(instance.port || 0) + 1,
+  });
+
+  applyInstancePort(instance, nextPort);
+  instance.status = "stopped";
+  instance.provisioning = {
+    status: "running",
+    percent: 5,
+    stage: "queued",
+    message: "正在重新创建实例目录与默认配置。",
+    updatedAt: nowIso(),
+  };
+  instance.wechatBinding = {
+    status: "idle",
+    updatedAt: null,
+    qrMode: null,
+    qrPayload: "",
+    qrLink: "",
+    outputSnippet: "",
+    pairedAccounts: [],
+  };
+  instance.modelAuth = {
+    status: "idle",
+    updatedAt: null,
+    message: "",
+    outputSnippet: "",
+    authUrl: "",
+    promptLabel: "",
+    needsInput: false,
+  };
+  instance.updatedAt = nowIso();
+
+  mutateDatabase(dataDir, (draft) => {
+    const target = draft.instances.find((record) => record.id === instance.id);
+    if (!target) {
+      return;
+    }
+    syncInstanceModelChainShape(target);
+    Object.assign(target, instance);
+  });
+
+  startProvisioningJob(instance.id, instance);
 
   sendJson(response, 202, {
     instance: publicInstanceForHost(instance, resolveRequestHost(request)),
@@ -1235,13 +1439,13 @@ async function handleUpdateModel(request, response, instanceId) {
   };
 
   instance.updatedAt = nowIso();
-  const paths = writeInstanceFiles(dataDir, instance);
   const runtimeState = await inspectInstance(instance);
 
   if (runtimeState.running) {
-    await restartInstance(projectRoot, paths, instance);
+    await startInstanceWithPortRecovery(instance);
     instance.status = "running";
   } else {
+    writeInstanceFiles(dataDir, instance);
     instance.status = runtimeState.status;
   }
 
@@ -1261,13 +1465,13 @@ async function handleUpdateModel(request, response, instanceId) {
 
 async function persistInstanceModelConfig(instance) {
   syncInstanceModelChainShape(instance);
-  const paths = writeInstanceFiles(dataDir, instance);
   const runtimeState = await inspectInstance(instance);
 
   if (runtimeState.running) {
-    await restartInstance(projectRoot, paths, instance);
+    await startInstanceWithPortRecovery(instance);
     instance.status = "running";
   } else {
+    writeInstanceFiles(dataDir, instance);
     instance.status = runtimeState.status;
   }
 
@@ -1732,8 +1936,7 @@ async function handleStartInstance(request, response, instanceId) {
     return;
   }
 
-  const paths = writeInstanceFiles(dataDir, instance);
-  const runtimeState = await startInstance(projectRoot, paths, instance);
+  const runtimeState = await startInstanceWithPortRecovery(instance);
 
   mutateDatabase(dataDir, (draft) => {
     const target = draft.instances.find((record) => record.id === instance.id);
@@ -2098,7 +2301,7 @@ const server = http.createServer(async (request, response) => {
       return;
     }
 
-    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|logs|plugins|restart-gateway|stats)$/);
+    const instanceMatch = pathname.match(/^\/api\/instances\/([^/]+)\/(model|start|stop|wechat-bind|logs|plugins|restart-gateway|stats|recreate)$/);
     if (instanceMatch) {
       const [, instanceId, action] = instanceMatch;
 
@@ -2114,6 +2317,11 @@ const server = http.createServer(async (request, response) => {
 
       if (request.method === "POST" && action === "start") {
         await handleStartInstance(request, response, instanceId);
+        return;
+      }
+
+      if (request.method === "POST" && action === "recreate") {
+        await handleRecreateInstance(request, response, instanceId);
         return;
       }
 

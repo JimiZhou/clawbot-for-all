@@ -1185,6 +1185,11 @@ img {
   box-shadow: var(--shadow-sm);
 }
 
+.provisioning-banner-error {
+  border-color: color-mix(in oklab, var(--danger) 30%, var(--border));
+  background: linear-gradient(135deg, color-mix(in oklab, var(--danger) 10%, white), color-mix(in oklab, var(--card) 86%, white));
+}
+
 .provisioning-banner::after,
 .loading-panel::after,
 .log-output-refreshing::before {
@@ -1213,6 +1218,16 @@ img {
 
 .provisioning-info span {
   color: var(--text-secondary);
+}
+
+.provisioning-banner-error .provisioning-info strong {
+  color: var(--danger);
+}
+
+.provisioning-actions {
+  display: flex;
+  justify-content: flex-start;
+  margin-bottom: 12px;
 }
 
 .progress-bar,
