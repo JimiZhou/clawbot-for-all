@@ -219,3 +219,7 @@ Local development requirements:
 ## 4. License
 
 MIT
+
+## 5. 感谢
+
+[LinuxDo社区](https://linux.do/)
