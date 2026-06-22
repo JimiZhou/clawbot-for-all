@@ -16,7 +16,7 @@ Multi-tenant OpenClaw control plane with per-user instances, preinstalled WeChat
 - 实例容器支持通过环境变量限制 CPU 和内存，便于单机部署多个实例
 - App / Runner 镜像通过 GitHub Actions 发布到 GHCR
 - 发布镜像支持 `linux/amd64` 与 `linux/arm64`
-- Runner 镜像默认钉死已验证组合：`openclaw@2026.3.13` + `@tencent-weixin/openclaw-weixin@1.0.3`
+- Runner 镜像默认钉死已验证组合：`openclaw@2026.6.1` + `@tencent-weixin/openclaw-weixin@2.4.4`
 
 ### English
 
@@ -28,7 +28,7 @@ Multi-tenant OpenClaw control plane with per-user instances, preinstalled WeChat
 - Per-instance container CPU and memory limits can be configured with environment variables
 - App and runner images are published to GHCR via GitHub Actions
 - Published images support both `linux/amd64` and `linux/arm64`
-- The runner image is pinned to a verified pairing: `openclaw@2026.3.13` + `@tencent-weixin/openclaw-weixin@1.0.3`
+- The runner image is pinned to a verified pairing: `openclaw@2026.6.1` + `@tencent-weixin/openclaw-weixin@2.4.4`
 
 ## 2. 如何快速 Docker 部署
 
@@ -85,7 +85,7 @@ docker logs -f clawbot-for-all
 
 - `OPENCLAW_RUNNER_CPUS`：限制每个实例容器可用 CPU，例如 `0.5`、`1.0`、`2`
 - `OPENCLAW_RUNNER_MEMORY`：限制每个实例容器内存，例如 `512m`、`1g`、`2g`
-- 当前 `latest` runner 镜像应内置已验证版本组合：`openclaw@2026.3.13` + `@tencent-weixin/openclaw-weixin@1.0.3`
+- 当前 `latest` runner 镜像应内置已验证版本组合：`openclaw@2026.6.1` + `@tencent-weixin/openclaw-weixin@2.4.4`
 - 业务数据和 server 日志保存在 `./data`
 - server 日志文件路径为 `./data/logs/server.log`
 - 应用容器必须挂载 `/var/run/docker.sock`
@@ -144,7 +144,7 @@ Notes:
 
 - `OPENCLAW_RUNNER_CPUS` limits CPU per instance container, for example `0.5`, `1.0`, or `2`
 - `OPENCLAW_RUNNER_MEMORY` limits memory per instance container, for example `512m`, `1g`, or `2g`
-- The current `latest` runner image is expected to ship with the verified pairing `openclaw@2026.3.13` + `@tencent-weixin/openclaw-weixin@1.0.3`
+- The current `latest` runner image is expected to ship with the verified pairing `openclaw@2026.6.1` + `@tencent-weixin/openclaw-weixin@2.4.4`
 - App data and server logs are stored under `./data`
 - Server log file path is `./data/logs/server.log`
 - The app container must mount `/var/run/docker.sock`
@@ -216,10 +216,27 @@ Local development requirements:
 - Docker Desktop or Docker Engine
 - The host machine must be allowed to run `docker pull`, `docker run`, `docker rm`, `docker exec`, and `docker logs`
 
-## 4. License
+
+## 4. Runner 镜像自动跟随 OpenClaw
+
+### 中文
+
+- `.github/workflows/auto-publish-runner.yml` 每天自动查询 npm 上最新的 `openclaw` 和 `@tencent-weixin/openclaw-weixin` 版本，并用这些版本构建、推送 `ghcr.io/<owner>/clawbot-openclaw-runner`。
+- 也可以在 GitHub Actions 页面手动触发该 workflow，并通过 `openclaw_version` / `wechat_plugin_spec` 输入指定临时测试版本。
+- 自动构建会推送 `latest`、`openclaw-<version>`、日期和 `sha-` 标签，便于生产环境固定版本或继续使用 `latest`。
+- 常规 `publish-images.yml` 仍保留固定版本参数，用于 tag/release 和 pull request 验证构建。
+
+### English
+
+- `.github/workflows/auto-publish-runner.yml` queries the latest `openclaw` and `@tencent-weixin/openclaw-weixin` versions from npm every day, then builds and pushes `ghcr.io/<owner>/clawbot-openclaw-runner` with those versions.
+- The workflow can also be triggered manually from GitHub Actions with `openclaw_version` / `wechat_plugin_spec` inputs for testing a specific version.
+- Automated builds publish `latest`, `openclaw-<version>`, date, and `sha-` tags so deployments can either pin a known version or keep following `latest`.
+- The regular `publish-images.yml` workflow still keeps pinned runner arguments for tag/release builds and pull request validation.
+
+## 5. License
 
 MIT
 
-## 5. 感谢
+## 6. 感谢
 
 [LinuxDo社区](https://linux.do/)

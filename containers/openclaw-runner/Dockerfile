@@ -1,7 +1,7 @@
 FROM node:22-bookworm-slim
 
-ARG OPENCLAW_VERSION=2026.3.13
-ARG OPENCLAW_WECHAT_PLUGIN_SPEC=@tencent-weixin/openclaw-weixin@1.0.3
+ARG OPENCLAW_VERSION=2026.6.1
+ARG OPENCLAW_WECHAT_PLUGIN_SPEC=@tencent-weixin/openclaw-weixin@2.4.4
 
 LABEL io.clawbot.openclaw.version="${OPENCLAW_VERSION}"
 
@@ -40,10 +40,15 @@ RUN mkdir -p "${OPENCLAW_PREINSTALLED_HOME}" \
        '  }' \
        '}' \
        > "${OPENCLAW_PREINSTALLED_HOME}/openclaw.json" \
-    && OPENCLAW_HOME="${OPENCLAW_PREINSTALLED_HOME}" \
-       OPENCLAW_CONFIG_PATH="${OPENCLAW_PREINSTALLED_HOME}/openclaw.json" \
-       openclaw plugins install "${OPENCLAW_WECHAT_PLUGIN_SPEC}" \
-    && cd "${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}" \
+    && export OPENCLAW_HOME="${OPENCLAW_PREINSTALLED_HOME}" \
+    && export OPENCLAW_CONFIG_PATH="${OPENCLAW_PREINSTALLED_HOME}/openclaw.json" \
+    && echo "y" | openclaw plugins install "${OPENCLAW_WECHAT_PLUGIN_SPEC}" \
+    && PLUGIN_DIR=$(find "${OPENCLAW_PREINSTALLED_HOME}" -type d -name "*openclaw-weixin*" | head -1) \
+    && test -n "${PLUGIN_DIR}" \
+    && TARGET_PLUGIN_DIR="${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}" \
+    && mkdir -p "${TARGET_PLUGIN_DIR}" \
+    && if [ "$(cd "${PLUGIN_DIR}" && pwd)" != "$(cd "${TARGET_PLUGIN_DIR}" && pwd)" ]; then cp -R "${PLUGIN_DIR}/." "${TARGET_PLUGIN_DIR}/"; fi \
+    && cd "${TARGET_PLUGIN_DIR}" \
     && npm prune --omit=dev \
     && mkdir -p "${OPENCLAW_PREINSTALLED_HOME}/.openclaw/extensions/${OPENCLAW_WECHAT_CHANNEL_ID}/node_modules" \
     && ln -sfn /usr/local/lib/node_modules/openclaw \

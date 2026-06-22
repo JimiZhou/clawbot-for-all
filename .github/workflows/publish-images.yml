@@ -14,8 +14,8 @@ permissions:
   packages: write
 
 env:
-  RUNNER_OPENCLAW_VERSION: 2026.3.13
-  RUNNER_WECHAT_PLUGIN_SPEC: "@tencent-weixin/openclaw-weixin@1.0.3"
+  RUNNER_OPENCLAW_VERSION: 2026.6.1
+  RUNNER_WECHAT_PLUGIN_SPEC: "@tencent-weixin/openclaw-weixin@2.4.4"
 
 jobs:
   build-images:

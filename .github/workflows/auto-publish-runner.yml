@@ -1,0 +1,103 @@
+name: Auto Publish Runner
+
+on:
+  schedule:
+    # Follow OpenClaw npm releases automatically once per day.
+    - cron: "27 3 * * *"
+  workflow_dispatch:
+    inputs:
+      openclaw_version:
+        description: "OpenClaw version to build. Use latest to resolve from npm."
+        required: false
+        default: "latest"
+      wechat_plugin_spec:
+        description: "WeChat plugin spec. Use latest to resolve from npm."
+        required: false
+        default: "@tencent-weixin/openclaw-weixin@latest"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-runner:
+    name: Build runner for latest OpenClaw
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve OpenClaw and plugin versions
+        id: versions
+        shell: bash
+        env:
+          REQUESTED_OPENCLAW_VERSION: ${{ inputs.openclaw_version || 'latest' }}
+          REQUESTED_WECHAT_PLUGIN_SPEC: ${{ inputs.wechat_plugin_spec || '@tencent-weixin/openclaw-weixin@latest' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${REQUESTED_OPENCLAW_VERSION}" = "latest" ]; then
+            openclaw_version="$(npm view openclaw version)"
+          else
+            openclaw_version="${REQUESTED_OPENCLAW_VERSION}"
+          fi
+
+          if [ "${REQUESTED_WECHAT_PLUGIN_SPEC}" = "@tencent-weixin/openclaw-weixin@latest" ]; then
+            wechat_plugin_version="$(npm view @tencent-weixin/openclaw-weixin version)"
+            wechat_plugin_spec="@tencent-weixin/openclaw-weixin@${wechat_plugin_version}"
+          else
+            wechat_plugin_spec="${REQUESTED_WECHAT_PLUGIN_SPEC}"
+          fi
+
+          echo "openclaw_version=${openclaw_version}" >> "$GITHUB_OUTPUT"
+          echo "wechat_plugin_spec=${wechat_plugin_spec}" >> "$GITHUB_OUTPUT"
+          echo "Building runner with openclaw@${openclaw_version} and ${wechat_plugin_spec}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare image name
+        id: prep
+        shell: bash
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${owner}/clawbot-openclaw-runner" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.prep.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=openclaw-${{ steps.versions.outputs.openclaw_version }}
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+            type=sha,prefix=sha-
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push runner image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: containers/openclaw-runner/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            io.clawbot.openclaw.version=${{ steps.versions.outputs.openclaw_version }}
+          build-args: |
+            OPENCLAW_VERSION=${{ steps.versions.outputs.openclaw_version }}
+            OPENCLAW_WECHAT_PLUGIN_SPEC=${{ steps.versions.outputs.wechat_plugin_spec }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
