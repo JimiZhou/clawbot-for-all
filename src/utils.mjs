@@ -24,6 +24,20 @@ export function readJsonFile(filePath, fallback) {
       return fallback;
     }
 
+    if (error instanceof SyntaxError) {
+      // The primary file is present but corrupted (e.g. torn write after a crash).
+      // Fall back to the last known-good backup instead of taking the whole app down.
+      try {
+        return JSON.parse(fs.readFileSync(`${filePath}.bak`, "utf8"));
+      } catch (backupError) {
+        if (backupError.code === "ENOENT") {
+          throw error;
+        }
+
+        throw backupError;
+      }
+    }
+
     throw error;
   }
 }
@@ -32,7 +46,33 @@ export function writeJsonFile(filePath, value) {
   const dirName = path.dirname(filePath);
   ensureDir(dirName);
   const tempPath = `${filePath}.${randomId(4)}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const fd = fs.openSync(tempPath, "w");
+  try {
+    fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    // Flush data to disk before the rename so a power loss cannot leave an
+    // empty/truncated file behind the atomic rename.
+    fs.fsyncSync(fd);
+  } catch (error) {
+    fs.closeSync(fd);
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // best-effort cleanup of the temp file
+    }
+    throw error;
+  }
+  fs.closeSync(fd);
+
+  // Keep a backup of the previous good file so readJsonFile can recover from a
+  // corrupted primary.
+  try {
+    fs.copyFileSync(filePath, `${filePath}.bak`);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
   fs.renameSync(tempPath, filePath);
 }
 
@@ -83,10 +123,22 @@ export function setCookieHeader(name, value, options = {}) {
   return parts.join("; ");
 }
 
-export async function parseRequestBody(request) {
+export const MAX_REQUEST_BODY_BYTES = 1024 * 1024;
+
+export async function parseRequestBody(request, maxBytes = MAX_REQUEST_BODY_BYTES) {
   const chunks = [];
+  let total = 0;
 
   for await (const chunk of request) {
+    total += chunk.length;
+    if (total > maxBytes) {
+      // Stop consuming the body so a hostile client cannot exhaust memory. We leave the
+      // socket intact (no destroy) so the caller can still send an error response.
+      const error = new Error("请求体过大。");
+      error.statusCode = 413;
+      throw error;
+    }
+
     chunks.push(chunk);
   }
 

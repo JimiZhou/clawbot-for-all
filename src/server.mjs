@@ -74,6 +74,11 @@ const port = Number(process.env.PORT || 4300);
 const host = process.env.HOST || "0.0.0.0";
 const sessionTtlDays = Number(process.env.SESSION_TTL_DAYS || 14);
 const publicOrigin = String(process.env.PUBLIC_ORIGIN || "").trim();
+// Mark the session cookie Secure when the deployment is served over HTTPS. Behind a
+// TLS-terminating proxy the app only sees http, so we key off PUBLIC_ORIGIN (or an
+// explicit override) rather than the request protocol.
+const cookieSecure = /^true$/i.test(process.env.COOKIE_SECURE || "")
+  || /^https:/i.test(publicOrigin);
 const rawAdminEmail = String(process.env.ADMIN_EMAIL || "");
 const rawAdminName = String(process.env.ADMIN_NAME || "");
 const rawAdminPassword = String(process.env.ADMIN_PASSWORD || "");
@@ -254,7 +259,9 @@ void (async () => {
   await repairInstancesMissingModelInBackground();
   await repairInstanceConfigDriftInBackground();
   await repairInstanceMountDriftInBackground();
-})();
+})().catch((error) => {
+  logServer("error", "后台实例修复任务失败。", { error: error?.message || String(error) });
+});
 
 function resolveRequestHost(request) {
   return request.headers["x-forwarded-host"] || request.headers.host || "";
@@ -1198,6 +1205,7 @@ async function handleRegister(request, response) {
     {
       "Set-Cookie": setCookieHeader(sessionCookieName, session.id, {
         maxAge: sessionTtlDays * 24 * 60 * 60,
+        secure: cookieSecure,
       }),
     },
   );
@@ -1234,6 +1242,7 @@ async function handleLogin(request, response) {
     {
       "Set-Cookie": setCookieHeader(sessionCookieName, session.id, {
         maxAge: sessionTtlDays * 24 * 60 * 60,
+        secure: cookieSecure,
       }),
     },
   );
@@ -1254,7 +1263,7 @@ async function handleLogout(request, response) {
     200,
     { ok: true },
     {
-      "Set-Cookie": setCookieHeader(sessionCookieName, "", { maxAge: 0 }),
+      "Set-Cookie": setCookieHeader(sessionCookieName, "", { maxAge: 0, secure: cookieSecure }),
     },
   );
 }
@@ -1496,9 +1505,23 @@ async function handleCreateInstance(request, response) {
     port: assignedPort,
   });
 
+  // Re-check the single-instance limit inside the atomic mutator: two concurrent
+  // requests can both pass the check above (they load the same snapshot before either
+  // writes), so the mutator is the only place the invariant can be enforced safely.
+  let limitHit = false;
   mutateDatabase(dataDir, (draft) => {
+    if (draft.instances.filter((record) => record.userId === user.id).length >= 1) {
+      limitHit = true;
+      return;
+    }
+
     draft.instances.push(instance);
   });
+
+  if (limitHit) {
+    sendJson(response, 409, { error: "每个用户只能创建一个实例。" });
+    return;
+  }
 
   startProvisioningJob(instance.id, instance);
   logServer("info", `用户已提交实例创建：${instance.id}`, {
@@ -2023,13 +2046,22 @@ async function handleStartModelAuth(request, response, instanceId) {
 
       if (code === 0) {
         syncInstanceModelProviderConfig(instance.id);
+        let restartFailed = false;
         try {
           const latest = loadDatabase(dataDir).instances.find((record) => record.id === instance.id) || instance;
           await restartManagedInstance(latest);
-        } catch {}
+        } catch (error) {
+          restartFailed = true;
+          logServer("error", `模型登录成功但网关重启失败：${instance.id}`, {
+            instanceId: instance.id,
+            error: error?.message || String(error),
+          });
+        }
         patchModelAuthState(instance.id, {
           status: "success",
-          message: "模型登录已完成。",
+          message: restartFailed
+            ? "模型登录已完成，但网关重启失败，请手动重启网关使新凭据生效。"
+            : "模型登录已完成。",
           outputSnippet: trimTo(output, 4000),
           needsInput: false,
           promptLabel: "",
