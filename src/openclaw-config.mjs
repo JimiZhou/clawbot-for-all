@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { buildProviderConfigFromModel, normalizeModelChain, normalizeModelSelection } from "./model-providers.mjs";
-import { ensureDir, nowIso, slugify, writeJsonFile } from "./utils.mjs";
+import { ensureDir, nowIso, randomId, slugify, writeJsonFile } from "./utils.mjs";
 import { withWechatPluginEnabled } from "./wechat-plugin.mjs";
 
 export const INSTANCE_BASE_PORT = 19000;
@@ -18,7 +18,7 @@ export function getInstancePaths(dataDir, instanceId) {
 }
 
 export function createInstanceRecord({ userId, name, model, nextIndex, port: assignedPort = null }) {
-  const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const id = `${Date.now().toString(36)}-${randomId(4)}`;
   const createdAt = nowIso();
   const port = Number.isInteger(assignedPort) && assignedPort > INSTANCE_BASE_PORT
     ? assignedPort
@@ -35,7 +35,7 @@ export function createInstanceRecord({ userId, name, model, nextIndex, port: ass
     port,
     dashboardUrl: `http://127.0.0.1:${port}/`,
     containerName: `clawbot-openclaw-${id}`,
-    gatewayToken: `${id}-${Math.random().toString(36).slice(2, 12)}`,
+    gatewayToken: `${id}-${randomId(24)}`,
     createdAt,
     updatedAt: createdAt,
     provisioning: {

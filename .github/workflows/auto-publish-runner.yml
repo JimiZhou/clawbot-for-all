@@ -1,9 +1,6 @@
 name: Auto Publish Runner
 
 on:
-  schedule:
-    # Follow OpenClaw npm releases automatically once per day.
-    - cron: "27 3 * * *"
   workflow_dispatch:
     inputs:
       openclaw_version:

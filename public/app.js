@@ -76,6 +76,21 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+// Sanitize a value before inserting it into an href/src attribute. Only allow
+// http(s) links (plus data:image for QR images), and always HTML-escape so a hostile
+// value cannot break out of the quoted attribute and inject event handlers.
+function safeUrlAttr(value, { allowDataImage = false } = {}) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return "";
+  if (allowDataImage && /^data:image\//i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return escapeHtml(trimmed);
+  }
+  return "";
+}
+
 function requestJson(url, options = {}) {
   return fetch(url, {
     credentials: "include",
@@ -84,12 +99,25 @@ function requestJson(url, options = {}) {
   }).then(async (response) => {
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
+      // Session expired/invalidated: drop the local session and return to login so
+      // pollers stop firing doomed requests and the UI doesn't stay stuck on stale data.
+      if (response.status === 401 && !String(url).startsWith("/api/login")) {
+        handleUnauthorized();
+      }
       const error = new Error(payload.error || "请求失败");
       error.payload = payload;
+      error.status = response.status;
       throw error;
     }
     return payload;
   });
+}
+
+function handleUnauthorized() {
+  if (!state.user) return;
+  state.user = null;
+  updatePolling();
+  navigate("#/login");
 }
 
 function formatDateTime(value) {
@@ -1661,7 +1689,7 @@ function bindingContent(inst, binding, pairedAccounts) {
   return `
     <div class="form-actions" style="justify-content:flex-start;margin-bottom:8px">
       <button class="btn ${bindingActive ? "btn-secondary" : "btn-primary"} btn-sm" data-action="${bindingActive ? "wechat-rebind" : "wechat-bind"}" data-instance-id="${inst.id}">${busyBind ? "生成中..." : primaryLabel}</button>
-      ${qrLink ? `<a class="btn btn-ghost btn-sm" href="${qrLink}" target="_blank" rel="noreferrer">打开微信扫码页</a>` : ""}
+      ${safeUrlAttr(qrLink) ? `<a class="btn btn-ghost btn-sm" href="${safeUrlAttr(qrLink)}" target="_blank" rel="noreferrer">打开微信扫码页</a>` : ""}
     </div>
     ${qrMarkup(binding, qrImageSrc, qrLink)}
       ${visibleLog && binding.status !== "connected" ? `<pre class="log-output small-log">${escapeHtml(visibleLog)}</pre>` : ""}
@@ -1828,14 +1856,68 @@ function qrMarkup(binding, qrImageSrc, qrLink) {
   if (!qrImageSrc && !qrLink) return "";
   return `
     <div class="qr-display">
-      ${qrImageSrc ? `<img src="${qrImageSrc}" alt="微信绑定二维码" />` : `<p class="text-muted">当前未拿到可直接渲染的二维码图片，请使用上方链接继续扫码。</p>`}
+      ${safeUrlAttr(qrImageSrc, { allowDataImage: true }) ? `<img src="${safeUrlAttr(qrImageSrc, { allowDataImage: true })}" alt="微信绑定二维码" />` : `<p class="text-muted">当前未拿到可直接渲染的二维码图片，请使用上方链接继续扫码。</p>`}
       ${qrLink ? `<p class="qr-link-hint">如果二维码过期，点击“重新生成二维码”即可拿到新的扫码入口。</p>` : ""}
     </div>`;
 }
 
 /* ── Render ───────────────────────────────────────────── */
 
+function captureFocusState() {
+  const el = document.activeElement;
+  if (!el || !(el instanceof HTMLElement)) return null;
+  if (!/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return null;
+  const form = el.closest("form[data-form]");
+  const snapshot = {
+    formKey: form ? form.getAttribute("data-form") : null,
+    name: el.getAttribute("name") || null,
+    id: el.id || null,
+    value: "value" in el ? el.value : null,
+    selStart: null,
+    selEnd: null,
+  };
+  if (!snapshot.name && !snapshot.id) return null;
+  try {
+    snapshot.selStart = el.selectionStart;
+    snapshot.selEnd = el.selectionEnd;
+  } catch {
+    // selection API not available on this input type; ignore
+  }
+  return snapshot;
+}
+
+function restoreFocusState(snapshot) {
+  if (!snapshot) return;
+  let selector = "";
+  if (snapshot.id) {
+    selector = `#${CSS.escape(snapshot.id)}`;
+  } else {
+    const scope = snapshot.formKey ? `form[data-form="${CSS.escape(snapshot.formKey)}"] ` : "";
+    selector = `${scope}[name="${CSS.escape(snapshot.name)}"]`;
+  }
+  const el = document.querySelector(selector);
+  if (!el) return;
+  // The full innerHTML rebuild resets inputs to their server-rendered value (password
+  // fields even render value=""), so write the in-progress value back before focusing.
+  if (snapshot.value != null && "value" in el && el.value !== snapshot.value) {
+    el.value = snapshot.value;
+  }
+  try {
+    el.focus({ preventScroll: true });
+  } catch {
+    el.focus();
+  }
+  if (snapshot.selStart != null) {
+    try {
+      el.setSelectionRange(snapshot.selStart, snapshot.selEnd);
+    } catch {
+      // setSelectionRange unsupported on this input type; ignore
+    }
+  }
+}
+
 function renderNow() {
+  const focusSnapshot = captureFocusState();
   captureLogScrollPositions();
   const viewportScrollTop = window.scrollY;
   const route = currentRoute();
@@ -1860,6 +1942,7 @@ function renderNow() {
   html += `<div class="scene-shell ${motion.animate ? "scene-enter" : ""}" data-scene="${escapeHtml(motion.sceneKey)}">${viewHtml}</div>`;
   app.innerHTML = html;
   restoreLogScrollPositions();
+  restoreFocusState(focusSnapshot);
   if (!motion.animate) {
     window.scrollTo(0, viewportScrollTop);
   }
