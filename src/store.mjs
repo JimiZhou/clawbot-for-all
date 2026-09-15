@@ -138,9 +138,10 @@ export function saveDatabase(dataDir, database) {
 
 export function mutateDatabase(dataDir, mutator) {
   const database = loadDatabase(dataDir);
-  const result = mutator(database) ?? database;
-  saveDatabase(dataDir, database);
-  return result;
+  const mutated = mutator(database);
+  const next = mutated === undefined ? database : mutated;
+  saveDatabase(dataDir, next);
+  return next;
 }
 
 export function createSessionRecord(userId, ttlDays) {

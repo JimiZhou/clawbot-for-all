@@ -13,6 +13,10 @@ const WECHAT_BIND_TIMEOUT_MS = Number(process.env.OPENCLAW_WECHAT_BIND_TIMEOUT_M
 const RUNNER_IMAGE_INSPECT_TIMEOUT_MS = 15 * 1000;
 const RUNNER_CPUS = String(process.env.OPENCLAW_RUNNER_CPUS || "").trim();
 const RUNNER_MEMORY = String(process.env.OPENCLAW_RUNNER_MEMORY || "").trim();
+// Bind each instance gateway to loopback by default so it is not reachable from the
+// public network (which would bypass the control-plane's per-owner authorization and
+// leave only the gateway token). Set OPENCLAW_RUNNER_BIND_HOST=0.0.0.0 to opt back in.
+const RUNNER_BIND_HOST = String(process.env.OPENCLAW_RUNNER_BIND_HOST || "127.0.0.1").trim() || "127.0.0.1";
 
 const runnerImageState = {
   image: RUNNER_IMAGE,
@@ -61,14 +65,29 @@ function runProcess(command, args, options = {}) {
     let stderr = "";
     const timeoutMs = options.timeoutMs || 0;
     let timeoutId = null;
+    let killTimeoutId = null;
     let timedOut = false;
 
     if (timeoutMs > 0) {
       timeoutId = setTimeout(() => {
         timedOut = true;
         child.kill("SIGTERM");
+        // Escalate to SIGKILL if the child ignores SIGTERM, otherwise this promise
+        // (and the request awaiting it) hangs until the process eventually exits.
+        killTimeoutId = setTimeout(() => {
+          child.kill("SIGKILL");
+        }, 5000);
       }, timeoutMs);
     }
+
+    const clearTimers = () => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      if (killTimeoutId) {
+        clearTimeout(killTimeoutId);
+      }
+    };
 
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
@@ -78,11 +97,12 @@ function runProcess(command, args, options = {}) {
       stderr += chunk.toString("utf8");
     });
 
-    child.on("error", reject);
+    child.on("error", (error) => {
+      clearTimers();
+      reject(error);
+    });
     child.on("close", (code) => {
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      clearTimers();
 
       resolve({
         code,
@@ -627,7 +647,7 @@ export async function startInstance(projectRoot, paths, instance) {
     ...resourceArgs,
     ...networkArgs,
     "-p",
-    `${instance.port}:18789`,
+    `${RUNNER_BIND_HOST}:${instance.port}:18789`,
     "-e",
     "OPENCLAW_HOME=/var/lib/openclaw",
     "-e",

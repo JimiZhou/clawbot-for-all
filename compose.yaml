@@ -12,7 +12,9 @@ services:
       PUBLIC_ORIGIN: http://127.0.0.1:4300
       ADMIN_EMAIL: admin@example.com
       ADMIN_NAME: 平台管理员
-      ADMIN_PASSWORD: ChangeMe123!
+      # 安全提示：留空则服务在首次启动时随机生成初始口令并写入容器日志（docker logs 查看）；
+      # 或设置为你自己的强口令。请勿在公网部署中使用示例口令——否则攻击者可在你首次登录前接管管理员账号。
+      ADMIN_PASSWORD: ""
       OPENCLAW_RUNNER_IMAGE: ghcr.io/jimizhou/clawbot-openclaw-runner:latest
       OPENCLAW_RUNNER_PULL_TIMEOUT_MS: 600000
       OPENCLAW_RUNNER_CPUS: "1.0"
